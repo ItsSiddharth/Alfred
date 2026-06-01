@@ -1,157 +1,166 @@
 /**
- * useWebSocket — connects to /ws/project/{projectId} and dispatches all
- * canonical WS event types into the Zustand store.
+ * api/useWebSocket.ts — WebSocket hook for a single project connection.
  *
- * Re-connects automatically on disconnect with exponential back-off.
- * Returns the WebSocket instance so callers can send messages if needed.
+ * Connects to ws://localhost:8000/ws/project/{projectId} when projectId is set.
+ * Parses incoming JSON envelopes and routes them to the Zustand store.
+ *
+ * Outbound messages are dispatched via the custom DOM event `alfred:send`.
+ * ChatBar fires: window.dispatchEvent(new CustomEvent('alfred:send', { detail: {...} }))
+ * This hook forwards that detail object as JSON to the WebSocket.
+ *
+ * Auto-reconnects on unexpected close (up to 5 attempts, exponential backoff).
  */
 
-import { useCallback, useEffect, useRef } from 'react'
+import { useEffect, useRef } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useStore } from '../store'
 
-// Canonical payload shapes matching C7
-interface WsEnvelope {
-  type: string
-  ts: string
-  payload: Record<string, unknown>
-}
-
-interface ProgressPayload {
-  stage: number
-  substage: string
-  label: string
-  current: number
-  total: number
-  status: 'running' | 'waiting' | 'error' | 'done' | 'idle'
-}
-
-interface TokenPayload {
-  token: string
-  message_id: string
-}
-
-const RECONNECT_BASE_MS = 1000
-const RECONNECT_MAX_MS = 16000
+const WS_BASE = 'ws://localhost:8000'
+const MAX_RETRIES = 5
 
 export function useWebSocket(projectId: number | null) {
   const wsRef = useRef<WebSocket | null>(null)
-  const reconnectDelay = useRef(RECONNECT_BASE_MS)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const unmounted = useRef(false)
+  const retryCountRef = useRef(0)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const { setProgress, appendToken, finaliseStream } = useStore()
-
-  const dispatch = useCallback(
-    (envelope: WsEnvelope) => {
-      const { type, payload } = envelope
-
-      switch (type) {
-        case 'progress': {
-          const p = payload as unknown as ProgressPayload
-          setProgress({
-            stage: p.stage,
-            substage: p.substage,
-            label: p.label,
-            current: p.current,
-            total: p.total,
-            status: p.status ?? 'running',
-          })
-          break
-        }
-
-        case 'token': {
-          const t = payload as unknown as TokenPayload
-          appendToken(t.message_id || 'stream', t.token)
-          break
-        }
-
-        case 'done': {
-          setProgress({ status: 'done' })
-          // Finalise any open streaming message
-          finaliseStream('stream')
-          break
-        }
-
-        case 'error': {
-          setProgress({ status: 'error' })
-          console.warn('[WS error]', payload)
-          break
-        }
-
-        case 'state_change':
-        case 'log':
-        case 'plan':
-        case 'approval_request':
-        case 'tool_call':
-        case 'result':
-        case 'plot':
-          // Handled by higher-level components in later stages.
-          // Log for observability during Stage 0.
-          console.debug('[WS]', type, payload)
-          break
-
-        default:
-          console.debug('[WS unknown]', type, payload)
-      }
-    },
-    [setProgress, appendToken, finaliseStream],
-  )
-
-  const connect = useCallback(() => {
-    if (projectId === null || unmounted.current) return
-
-    const url = `ws://${window.location.hostname}:8000/ws/project/${projectId}`
-    const ws = new WebSocket(url)
-    wsRef.current = ws
-
-    ws.onopen = () => {
-      reconnectDelay.current = RECONNECT_BASE_MS
-      console.info(`[WS] connected project=${projectId}`)
-    }
-
-    ws.onmessage = (ev: MessageEvent<string>) => {
-      try {
-        const envelope = JSON.parse(ev.data) as WsEnvelope
-        dispatch(envelope)
-      } catch (err) {
-        console.warn('[WS] failed to parse message', err)
-      }
-    }
-
-    ws.onclose = () => {
-      if (unmounted.current) return
-      console.info(`[WS] disconnected — reconnecting in ${reconnectDelay.current}ms`)
-      reconnectTimer.current = setTimeout(() => {
-        reconnectDelay.current = Math.min(reconnectDelay.current * 2, RECONNECT_MAX_MS)
-        connect()
-      }, reconnectDelay.current)
-    }
-
-    ws.onerror = (ev) => {
-      console.warn('[WS] error', ev)
-      ws.close()
-    }
-  }, [projectId, dispatch])
+  const { setProgress, appendToken, finaliseStream, resetProgress } = useStore()
+  const queryClient = useQueryClient()
 
   useEffect(() => {
-    unmounted.current = false
-    if (projectId !== null) connect()
+    if (!projectId) return
 
-    return () => {
-      unmounted.current = true
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
-      if (wsRef.current) {
-        wsRef.current.onclose = null // prevent reconnect on intentional close
-        wsRef.current.close()
+    let cancelled = false
+
+    function connect() {
+      if (cancelled) return
+
+      const url = `${WS_BASE}/ws/project/${projectId}`
+      const ws = new WebSocket(url)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        retryCountRef.current = 0
+        console.info(`[WS] Connected: project ${projectId}`)
+      }
+
+      ws.onmessage = (evt) => {
+        let envelope: { type: string; ts: string; payload: Record<string, unknown> }
+        try {
+          envelope = JSON.parse(evt.data)
+        } catch {
+          return
+        }
+
+        const { type, payload } = envelope
+
+        switch (type) {
+          case 'progress':
+            setProgress({
+              stage: (payload.stage as number) ?? 1,
+              substage: (payload.substage as string) ?? '',
+              label: (payload.label as string) ?? '',
+              current: (payload.current as number) ?? 0,
+              total: (payload.total as number) ?? 0,
+              status: (payload.status as 'running' | 'waiting' | 'error' | 'done' | 'idle') ?? 'running',
+            })
+            break
+
+          case 'token': {
+            const messageId = (payload.message_id as string) || 'stream'
+            const token = (payload.token as string) || ''
+            if (token) appendToken(messageId, token)
+            break
+          }
+
+          case 'done': {
+            // Finalise all active streaming messages.
+            const streams = useStore.getState().streamingMessages
+            Object.keys(streams).forEach((id) => finaliseStream(id))
+            setProgress({ status: 'done', label: (payload.summary as string) || 'Done' })
+            break
+          }
+
+          case 'error':
+            console.error('[WS] Error event:', payload)
+            setProgress({ status: 'error', label: (payload.message as string) || 'Error' })
+            break
+
+          case 'result':
+            // Handle model_pulled result — refresh local model list.
+            if ((payload as { kind?: string }).kind === 'model_pulled') {
+              queryClient.invalidateQueries({ queryKey: ['local-models'] })
+              queryClient.invalidateQueries({ queryKey: ['ollama-health'] })
+              // Remove from pulling set.
+              const model = payload.model as string
+              if (model) useStore.getState().removePullingModel(model)
+            }
+            break
+
+          case 'state_change':
+            // Stage 2 will route this properly.
+            console.info('[WS] state_change:', payload)
+            break
+
+          case 'log':
+          case 'plan':
+          case 'approval_request':
+          case 'tool_call':
+          case 'plot':
+            // Handled in later stages.
+            console.info(`[WS] ${type}:`, payload)
+            break
+
+          default:
+            console.debug('[WS] Unknown event type:', type, payload)
+        }
+      }
+
+      ws.onclose = (evt) => {
+        wsRef.current = null
+        if (cancelled) return
+        if (evt.wasClean) {
+          console.info('[WS] Closed cleanly')
+          return
+        }
+        // Unexpected close — retry with exponential backoff.
+        if (retryCountRef.current < MAX_RETRIES) {
+          const delay = Math.min(1000 * 2 ** retryCountRef.current, 15000)
+          retryCountRef.current += 1
+          console.warn(`[WS] Disconnected — retry ${retryCountRef.current} in ${delay}ms`)
+          retryTimerRef.current = setTimeout(connect, delay)
+        } else {
+          console.error('[WS] Max retries reached — giving up.')
+        }
+      }
+
+      ws.onerror = (evt) => {
+        console.warn('[WS] Socket error:', evt)
+        // onclose will fire next and handle the retry.
       }
     }
-  }, [projectId, connect])
 
-  const send = useCallback((data: unknown) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data))
+    connect()
+
+    // Forward alfred:send DOM events to the WebSocket.
+    function handleSendEvent(e: Event) {
+      const detail = (e as CustomEvent).detail
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(detail))
+      } else {
+        console.warn('[WS] Cannot send — socket not open', wsRef.current?.readyState)
+      }
     }
-  }, [])
+    window.addEventListener('alfred:send', handleSendEvent)
 
-  return { send }
+    return () => {
+      cancelled = true
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+      window.removeEventListener('alfred:send', handleSendEvent)
+      if (wsRef.current) {
+        wsRef.current.close(1000, 'project changed')
+        wsRef.current = null
+      }
+      resetProgress()
+    }
+  }, [projectId]) // eslint-disable-line react-hooks/exhaustive-deps
 }

@@ -6,6 +6,7 @@
  *  - pipeline progress strip data (fed by WS progress events)
  *  - streaming token accumulator (fed by WS token events)
  *  - config/setup status
+ *  - selected model + set of currently-pulling model tags
  *
  * Persistent data (projects, messages) lives in the DB and is fetched via
  * TanStack Query — not stored here.
@@ -48,6 +49,11 @@ export interface AlfredStore {
   // ── Selected model ─────────────────────────────────────────────────────
   selectedModel: string
   setSelectedModel: (model: string) => void
+
+  // ── Pulling models (set of tags currently being downloaded) ────────────
+  pullingModels: Set<string>
+  addPullingModel: (tag: string) => void
+  removePullingModel: (tag: string) => void
 
   // ── Progress strip ─────────────────────────────────────────────────────
   progress: ProgressState
@@ -97,6 +103,19 @@ export const useStore = create<AlfredStore>((set) => ({
   // Model
   selectedModel: '',
   setSelectedModel: (model) => set({ selectedModel: model }),
+
+  // Pulling models
+  pullingModels: new Set<string>(),
+  addPullingModel: (tag) =>
+    set((state) => ({
+      pullingModels: new Set([...state.pullingModels, tag]),
+    })),
+  removePullingModel: (tag) =>
+    set((state) => {
+      const next = new Set(state.pullingModels)
+      next.delete(tag)
+      return { pullingModels: next }
+    }),
 
   // Progress
   progress: defaultProgress,

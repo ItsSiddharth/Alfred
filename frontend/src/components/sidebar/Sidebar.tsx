@@ -1,16 +1,28 @@
 /**
  * Fixed left sidebar — ~280px wide per C5.
  *
- * Top section: Memory | Tools | Find models (placeholder panels for Stage 0).
+ * Top section: Memory | Tools | Find models panel nav items.
+ * When a nav item is active, a panel drawer opens to the right of the sidebar.
  * Bottom section: project list + New project button.
+ *
+ * Stage 1: FindModelsPanel is real. Memory and Tools are stubs (Stage 3/4).
  */
 
 import React, { useState } from 'react'
-import { BrainCircuit, Wrench, Cpu, Plus, FolderOpen, ChevronRight } from 'lucide-react'
+import {
+  BrainCircuit,
+  Wrench,
+  Cpu,
+  Plus,
+  FolderOpen,
+  ChevronRight,
+  X,
+} from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { projectsApi, type Project } from '../../api/client'
 import { useStore, type SidebarPanel } from '../../store'
 import { Button } from '../common/Button'
+import { FindModelsPanel } from './FindModelsPanel'
 
 // ── Panel nav item ────────────────────────────────────────────────────────
 
@@ -39,6 +51,76 @@ function NavItem({ icon, label, panel }: NavItemProps) {
       <span className="truncate">{label}</span>
       {active && <ChevronRight size={12} className="ml-auto shrink-0" />}
     </button>
+  )
+}
+
+// ── Panel drawer ──────────────────────────────────────────────────────────
+
+function PanelDrawer({ panel }: { panel: SidebarPanel }) {
+  const { setSidebarPanel } = useStore()
+
+  if (!panel) return null
+
+  const titles: Record<NonNullable<SidebarPanel>, string> = {
+    memory: 'Memory',
+    tools: 'Tools',
+    'find-models': 'Find models',
+  }
+
+  const renderContent = () => {
+    if (panel === 'find-models') return <FindModelsPanel />
+
+    // Stubs for Stage 3 (memory) and Stage 4 (tools)
+    const descriptions: Record<string, string> = {
+      memory: 'Memory engine — built in Stage 3. Will show remembered facts, preferences, and dataset references.',
+      tools: 'Tool bus — built in Stage 4. Will show registered tools, enable/disable toggles, and recent call logs.',
+    }
+    return (
+      <div className="flex flex-col h-full">
+        <div
+          className="flex items-center justify-between px-4 py-3 border-b shrink-0"
+          style={{ borderColor: 'var(--border)' }}
+        >
+          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+            {titles[panel]}
+          </span>
+          <button
+            onClick={() => setSidebarPanel(null)}
+            className="p-1 rounded transition-colors"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <div className="flex-1 flex items-center justify-center p-6 text-center">
+          <div>
+            <div
+              className="text-sm font-medium mb-2"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              {titles[panel]}
+            </div>
+            <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+              {descriptions[panel]}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className="flex flex-col h-full"
+      style={{
+        width: '300px',
+        backgroundColor: 'var(--bg-surface)',
+        borderRight: '1px solid var(--border)',
+        flexShrink: 0,
+      }}
+    >
+      {renderContent()}
+    </div>
   )
 }
 
@@ -83,7 +165,7 @@ function ProjectItem({ project, isActive, onSelect }: ProjectItemProps) {
             className="w-1.5 h-1.5 rounded-full shrink-0"
             style={{ backgroundColor: stageColors[project.current_stage] ?? 'var(--text-tertiary)' }}
           />
-          <span className="text-sm truncate" style={{ color: 'var(--text-tertiary)' }}>
+          <span className="text-xs truncate" style={{ color: 'var(--text-tertiary)' }}>
             {project.current_stage}
           </span>
         </div>
@@ -92,7 +174,7 @@ function ProjectItem({ project, isActive, onSelect }: ProjectItemProps) {
   )
 }
 
-// ── New project modal (minimal inline form) ────────────────────────────────
+// ── New project form ───────────────────────────────────────────────────────
 
 interface NewProjectFormProps {
   onDone: () => void
@@ -156,7 +238,7 @@ function NewProjectForm({ onDone }: NewProjectFormProps) {
 // ── Sidebar ────────────────────────────────────────────────────────────────
 
 export function Sidebar() {
-  const { activeProjectId, setActiveProjectId } = useStore()
+  const { activeProjectId, setActiveProjectId, sidebarPanel } = useStore()
   const [showNewForm, setShowNewForm] = useState(false)
 
   const { data: projects = [], isLoading } = useQuery({
@@ -165,81 +247,85 @@ export function Sidebar() {
   })
 
   return (
-    <aside
-      className="flex flex-col h-full shrink-0"
-      style={{
-        width: '280px',
-        backgroundColor: 'var(--bg-surface)',
-        borderRight: '1px solid var(--border)',
-      }}
-    >
-      {/* Logo / brand */}
-      <div
-        className="flex items-center gap-2.5 px-4 py-3 border-b"
-        style={{ borderColor: 'var(--border)' }}
+    <>
+      {/* Fixed sidebar rail */}
+      <aside
+        className="flex flex-col h-full shrink-0"
+        style={{
+          width: '280px',
+          backgroundColor: 'var(--bg-surface)',
+          borderRight: '1px solid var(--border)',
+        }}
       >
-        <span
-          className="text-lg font-medium font-mono tracking-widest"
-          style={{ color: 'var(--accent)' }}
-        >
-          ALFRED
-        </span>
-        <span className="text-sm" style={{ color: 'var(--text-tertiary)' }}>
-          research agent
-        </span>
-      </div>
-
-      {/* Top nav — Memory / Tools / Find models */}
-      <nav className="flex flex-col gap-0.5 px-2 py-3">
-        <NavItem icon={<BrainCircuit size={15} />} label="Memory" panel="memory" />
-        <NavItem icon={<Wrench size={15} />} label="Tools" panel="tools" />
-        <NavItem icon={<Cpu size={15} />} label="Find models" panel="find-models" />
-      </nav>
-
-      <div className="mx-3 border-t" style={{ borderColor: 'var(--border)' }} />
-
-      {/* Project history — fills remaining space */}
-      <div className="flex flex-col flex-1 min-h-0 pt-3">
+        {/* Logo / brand */}
         <div
-          className="flex items-center justify-between px-3 mb-2"
+          className="flex items-center gap-2.5 px-4 py-3 border-b"
+          style={{ borderColor: 'var(--border)' }}
         >
-          <span className="text-sm font-medium" style={{ color: 'var(--text-tertiary)' }}>
-            Projects
-          </span>
-          <button
-            onClick={() => setShowNewForm(true)}
-            className="flex items-center gap-1 text-sm px-1.5 py-0.5 rounded transition-colors"
+          <span
+            className="text-lg font-medium font-mono tracking-widest"
             style={{ color: 'var(--accent)' }}
-            title="New project"
           >
-            <Plus size={13} />
-            New
-          </button>
+            ALFRED
+          </span>
+          <span className="text-sm" style={{ color: 'var(--text-tertiary)' }}>
+            research agent
+          </span>
         </div>
 
-        {showNewForm && <NewProjectForm onDone={() => setShowNewForm(false)} />}
+        {/* Top nav — Memory / Tools / Find models */}
+        <nav className="flex flex-col gap-0.5 px-2 py-3">
+          <NavItem icon={<BrainCircuit size={15} />} label="Memory" panel="memory" />
+          <NavItem icon={<Wrench size={15} />} label="Tools" panel="tools" />
+          <NavItem icon={<Cpu size={15} />} label="Find models" panel="find-models" />
+        </nav>
 
-        <div className="flex-1 overflow-y-auto px-2 pb-3 flex flex-col gap-0.5">
-          {isLoading && (
-            <div className="px-3 py-2 text-sm" style={{ color: 'var(--text-tertiary)' }}>
-              Loading…
-            </div>
-          )}
-          {!isLoading && projects.length === 0 && !showNewForm && (
-            <div className="px-3 py-2 text-sm" style={{ color: 'var(--text-tertiary)' }}>
-              No projects yet. Click New to start.
-            </div>
-          )}
-          {projects.map((p) => (
-            <ProjectItem
-              key={p.id}
-              project={p}
-              isActive={p.id === activeProjectId}
-              onSelect={setActiveProjectId}
-            />
-          ))}
+        <div className="mx-3 border-t" style={{ borderColor: 'var(--border)' }} />
+
+        {/* Project history — fills remaining space */}
+        <div className="flex flex-col flex-1 min-h-0 pt-3">
+          <div className="flex items-center justify-between px-3 mb-2">
+            <span className="text-sm font-medium" style={{ color: 'var(--text-tertiary)' }}>
+              Projects
+            </span>
+            <button
+              onClick={() => setShowNewForm(true)}
+              className="flex items-center gap-1 text-sm px-1.5 py-0.5 rounded transition-colors"
+              style={{ color: 'var(--accent)' }}
+              title="New project"
+            >
+              <Plus size={13} />
+              New
+            </button>
+          </div>
+
+          {showNewForm && <NewProjectForm onDone={() => setShowNewForm(false)} />}
+
+          <div className="flex-1 overflow-y-auto px-2 pb-3 flex flex-col gap-0.5">
+            {isLoading && (
+              <div className="px-3 py-2 text-sm" style={{ color: 'var(--text-tertiary)' }}>
+                Loading…
+              </div>
+            )}
+            {!isLoading && projects.length === 0 && !showNewForm && (
+              <div className="px-3 py-2 text-sm" style={{ color: 'var(--text-tertiary)' }}>
+                No projects yet. Click New to start.
+              </div>
+            )}
+            {projects.map((p) => (
+              <ProjectItem
+                key={p.id}
+                project={p}
+                isActive={p.id === activeProjectId}
+                onSelect={setActiveProjectId}
+              />
+            ))}
+          </div>
         </div>
-      </div>
-    </aside>
+      </aside>
+
+      {/* Panel drawer — slides in beside sidebar */}
+      <PanelDrawer panel={sidebarPanel} />
+    </>
   )
 }

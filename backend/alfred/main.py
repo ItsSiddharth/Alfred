@@ -18,9 +18,9 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from alfred.api.config_router import router as config_router
+from alfred.api.models_router import router as models_router
 from alfred.api.projects_router import router as projects_router
 from alfred.config import get_config, is_configured, load_config, setup_logging
 from alfred.db import init_db
@@ -43,7 +43,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         init_db(cfg.db_path)
         logger.info("ALFRED backend ready — workspace: %s", cfg.workspace_path)
     else:
-        # No config yet; just set up basic console logging.
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -78,6 +77,7 @@ app.add_middleware(
 # Mount routers.
 app.include_router(config_router)
 app.include_router(projects_router)
+app.include_router(models_router)
 
 
 # ---------------------------------------------------------------------------
@@ -90,73 +90,75 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str) -> None:
     """
     Single persistent WebSocket per project.
 
-    On connection, immediately streams a demo sequence of progress + token
-    events so the frontend pipeline can be verified end-to-end in Stage 0.
-    In later stages, agents use manager.send() / broadcast_*() directly.
+    Receives JSON messages from the frontend:
+      {"type": "chat", "content": "...", "model": "qwen2.5:7b", "message_id": "..."}
+
+    In Stage 1 the only handled client→server message type is "chat" which
+    streams a response from Ollama back over the WS.  Unknown message types
+    are echoed back as "result" events for debugging.
     """
     await manager.connect(project_id, websocket)
     try:
-        # --- Demo stream (Stage 0 validation only) -------------------------
-        # Drives the progress strip through a fake pipeline so the frontend
-        # rendering can be verified before any real agent logic exists.
-        asyncio.create_task(_demo_stream(project_id))
-        # -------------------------------------------------------------------
-
-        # Keep the connection alive; wait for client messages (echoed back).
         while True:
-            data = await websocket.receive_text()
+            raw = await websocket.receive_text()
             try:
-                msg = json.loads(data)
+                msg = json.loads(raw)
             except json.JSONDecodeError:
-                msg = {"raw": data}
-            # Echo the message back so the frontend can confirm round-trip.
-            await manager.send(project_id, "result", {"echo": msg})
+                msg = {"type": "unknown", "raw": raw}
+
+            msg_type = msg.get("type", "unknown")
+
+            if msg_type == "chat":
+                await _handle_chat(project_id, msg)
+            else:
+                # Echo unknown messages back for debugging.
+                await manager.send(project_id, "result", {"echo": msg})
 
     except WebSocketDisconnect:
         await manager.disconnect(project_id)
 
 
-async def _demo_stream(project_id: str) -> None:
+async def _handle_chat(project_id: str, msg: dict) -> None:
     """
-    Sends a fake Stage-1 pipeline sequence over WebSocket.
+    Handle a chat message from the frontend.
 
-    Used only for Stage-0 acceptance testing.  Later stages replace this
-    with real agent events and this function is never called in production.
+    Expected msg fields:
+      content    — user's message text
+      model      — Ollama model tag to use
+      message_id — unique ID for this streaming response
     """
-    await asyncio.sleep(0.5)  # let the frontend settle
+    from alfred.agents.base import Role, make_client
+    from alfred.services.ollama import OllamaError
 
-    substages = [
-        ("generating_queries", "Generating search queries", 1, 5),
-        ("sweeping_sources", "Sweeping academic sources", 2, 5),
-        ("snowballing", "Expanding citations", 3, 5),
-        ("web_sweep", "Web sweep for implementations", 4, 5),
-        ("analyzing", "Synthesising results", 5, 5),
-    ]
+    content: str = msg.get("content", "").strip()
+    model: str = msg.get("model", "")
+    message_id: str = msg.get("message_id", "chat-response")
 
-    for substage, label, current, total in substages:
-        await manager.broadcast_progress(
+    if not content:
+        return
+
+    if not model:
+        await manager.broadcast_error(
             project_id,
-            stage=1,
-            substage=substage,
-            label=label,
-            current=current,
-            total=total,
-            status="running",
+            human_message="No model selected. Pick a model from the Find models panel.",
+            remediation="Open the sidebar → Find models → pull a model → select it.",
         )
-        await asyncio.sleep(0.8)
+        return
 
-    # Stream some fake tokens into the chat area.
-    fake_tokens = (
-        "Hello! I'm ALFRED, your local research agent. "
-        "This is a demo stream to verify the WebSocket pipeline is working end-to-end. "
-        "Once you configure a workspace and connect an Ollama model, real research will appear here."
-    ).split()
-
-    for token in fake_tokens:
-        await manager.broadcast_token(project_id, token + " ", message_id="demo-1")
-        await asyncio.sleep(0.05)
-
-    await manager.broadcast_done(project_id, summary="Demo stream complete")
+    client = make_client(model, project_id=project_id, ws_manager=manager)
+    try:
+        await client.chat(
+            Role.RESEARCHER,
+            [{"role": "user", "content": content}],
+            message_id=message_id,
+        )
+        await manager.broadcast_done(project_id, summary="Response complete")
+    except OllamaError as exc:
+        await manager.broadcast_error(
+            project_id,
+            human_message=str(exc),
+            remediation="Make sure Ollama is running and the selected model is pulled.",
+        )
 
 
 # ---------------------------------------------------------------------------
