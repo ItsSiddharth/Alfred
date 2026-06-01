@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── C5 CSS custom properties injected at :root ─────────────────────────── */
+:root {
+  --bg-base:       #0A0E14;
+  --bg-surface:    #111721;
+  --bg-elevated:   #1A2230;
+  --bg-inset:      #070A0F;
+  --border:        #232B3A;
+  --border-strong: #313C4F;
+
+  --text-primary:   #E6EDF3;
+  --text-secondary: #8B98A9;
+  --text-tertiary:  #5A6577;
+
+  --accent:        #38BDF8;
+  --accent-hover:  #7DD3FC;
+  --running:       #34D399;
+  --warn:          #F59E0B;
+  --danger:        #EF4444;
+  --success:       #22C55E;
+  --info:          #A78BFA;
+}
+
+/* ── Base resets ─────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  font-weight: 400;
+  /* Flat design — no gradients, no drop shadows */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Monospace elements ───────────────────────────────────────────────────── */
+code, pre, kbd, samp,
+.font-mono {
+  font-family: 'JetBrains Mono', Menlo, Monaco, monospace;
+}
+
+/* ── Scrollbar styling (webkit) ──────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-inset);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+/* ── Selection ───────────────────────────────────────────────────────────── */
+::selection {
+  background: var(--accent);
+  color: var(--bg-base);
+}
+
+/* ── Thinking tab pulsing dot animation ──────────────────────────────────── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+.pulse-dot {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+/* ── Progress bar fill animation ─────────────────────────────────────────── */
+@keyframes progress-stripes {
+  from { background-position: 0 0; }
+  to   { background-position: 28px 0; }
+}
+
+/* ── Smooth token streaming ──────────────────────────────────────────────── */
+.token-stream {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
