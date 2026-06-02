@@ -1,12 +1,15 @@
 /**
  * ChatBar — bottom input bar.
  *
- * Stage 1: model picker populated from /api/models/local; send dispatches a
- * "chat" message over the active project's WebSocket connection.
+ * Stage 2 additions:
+ *  - User messages are dispatched over WS (backend persists them to DB)
+ *  - "Show your work" toggle button (expands thinking tabs)
+ *  - Demo pipeline button (triggers scripted state machine walkthrough)
+ *  - Disabled while no project is active or no model selected
  */
 
 import React, { useState, useRef } from 'react'
-import { Send, ChevronDown, AlertCircle } from 'lucide-react'
+import { Send, ChevronDown, AlertCircle, Eye, EyeOff, FlaskConical } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { modelsApi } from '../../api/client'
 import { useStore } from '../../store'
@@ -45,13 +48,9 @@ function ModelPicker({ localNames, selected, onSelect }: ModelPickerProps) {
 
       {open && (
         <>
-          {/* Click-away backdrop */}
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
           <div
-            className="fixed inset-0 z-10"
-            onClick={() => setOpen(false)}
-          />
-          <div
-            className="absolute bottom-full left-0 mb-1 z-20 rounded border overflow-hidden shadow-lg"
+            className="absolute bottom-full left-0 mb-1 z-20 rounded border overflow-hidden"
             style={{
               backgroundColor: 'var(--bg-elevated)',
               borderColor: 'var(--border-strong)',
@@ -78,27 +77,18 @@ function ModelPicker({ localNames, selected, onSelect }: ModelPickerProps) {
               localNames.map((name) => (
                 <button
                   key={name}
-                  onClick={() => {
-                    onSelect(name)
-                    setOpen(false)
-                  }}
+                  onClick={() => { onSelect(name); setOpen(false) }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs font-mono transition-colors"
                   style={{
-                    backgroundColor:
-                      name === selected ? 'var(--bg-inset)' : 'transparent',
-                    color:
-                      name === selected ? 'var(--accent)' : 'var(--text-secondary)',
+                    backgroundColor: name === selected ? 'var(--bg-inset)' : 'transparent',
+                    color: name === selected ? 'var(--accent)' : 'var(--text-secondary)',
                   }}
                 >
                   <span
                     className="w-1.5 h-1.5 rounded-full shrink-0"
                     style={{
-                      backgroundColor:
-                        name === selected ? 'var(--running)' : 'transparent',
-                      border:
-                        name === selected
-                          ? 'none'
-                          : '1px solid var(--border-strong)',
+                      backgroundColor: name === selected ? 'var(--running)' : 'transparent',
+                      border: name === selected ? 'none' : '1px solid var(--border-strong)',
                     }}
                   />
                   {name}
@@ -119,9 +109,14 @@ function ModelPicker({ localNames, selected, onSelect }: ModelPickerProps) {
 export function ChatBar() {
   const [value, setValue] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const { selectedModel, setSelectedModel, activeProjectId } = useStore()
+  const {
+    selectedModel,
+    setSelectedModel,
+    activeProjectId,
+    showWorkMode,
+    toggleShowWork,
+  } = useStore()
 
-  // Pull local model names for the picker
   const { data: localData } = useQuery({
     queryKey: ['local-models'],
     queryFn: modelsApi.getLocal,
@@ -139,24 +134,44 @@ export function ChatBar() {
   const handleSend = () => {
     if (!value.trim() || !activeProjectId || !selectedModel) return
 
-    // Send a "chat" message over the active project's WebSocket.
-    // The WS hook in useWebSocket keeps a ref to the socket; we dispatch a
-    // custom DOM event that useWebSocket picks up and forwards.
     const messageId = `msg-${Date.now()}`
-    const event = new CustomEvent('alfred:send', {
-      detail: {
-        type: 'chat',
-        content: value.trim(),
-        model: selectedModel,
-        message_id: messageId,
-      },
+    // Dispatch over WS — backend persists user + assistant messages to DB.
+    window.dispatchEvent(
+      new CustomEvent('alfred:send', {
+        detail: {
+          type: 'chat',
+          content: value.trim(),
+          model: selectedModel,
+          message_id: messageId,
+        },
+      })
+    )
+
+    // Optimistically add the user message to the persisted list so it
+    // appears immediately without waiting for a DB round-trip.
+    useStore.getState().appendPersistedMessage({
+      id: Date.now(), // temporary id; real id comes on next reload
+      project_id: activeProjectId,
+      role: 'user',
+      content: value.trim(),
+      created_at: new Date().toISOString(),
+      kind: 'chat',
+      metadata_json: '{}',
     })
-    window.dispatchEvent(event)
 
     setValue('')
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
+  }
+
+  const handleDemoPipeline = () => {
+    if (!activeProjectId) return
+    window.dispatchEvent(
+      new CustomEvent('alfred:send', {
+        detail: { type: 'demo_pipeline', project_id: activeProjectId },
+      })
+    )
   }
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -171,10 +186,7 @@ export function ChatBar() {
   return (
     <div
       className="shrink-0 border-t px-4 py-3"
-      style={{
-        backgroundColor: 'var(--bg-surface)',
-        borderColor: 'var(--border)',
-      }}
+      style={{ backgroundColor: 'var(--bg-surface)', borderColor: 'var(--border)' }}
     >
       {/* No-model warning */}
       {activeProjectId && !selectedModel && localNames.length > 0 && (
@@ -233,8 +245,9 @@ export function ChatBar() {
         </button>
       </div>
 
-      {/* Model picker row */}
-      <div className="flex items-center gap-2 mt-2">
+      {/* Bottom toolbar row */}
+      <div className="flex items-center gap-3 mt-2">
+        {/* Model picker */}
         <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
           Model:
         </span>
@@ -243,10 +256,46 @@ export function ChatBar() {
           selected={selectedModel}
           onSelect={setSelectedModel}
         />
+
         {localNames.length === 0 && (
           <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
             — install via Find models →
           </span>
+        )}
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
+        {/* Show your work toggle */}
+        <button
+          onClick={toggleShowWork}
+          className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors"
+          title={showWorkMode ? 'Hide thinking tabs' : 'Show your work — expand all thinking tabs'}
+          style={{
+            color: showWorkMode ? 'var(--info)' : 'var(--text-tertiary)',
+            borderColor: showWorkMode ? 'rgba(167,139,250,0.4)' : 'var(--border)',
+            backgroundColor: showWorkMode ? 'rgba(167,139,250,0.08)' : 'transparent',
+          }}
+        >
+          {showWorkMode ? <Eye size={11} /> : <EyeOff size={11} />}
+          Show work
+        </button>
+
+        {/* Demo pipeline button — dev/QA convenience */}
+        {activeProjectId && (
+          <button
+            onClick={handleDemoPipeline}
+            className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors"
+            title="Trigger demo pipeline to test the state machine UI"
+            style={{
+              color: 'var(--text-tertiary)',
+              borderColor: 'var(--border)',
+              backgroundColor: 'transparent',
+            }}
+          >
+            <FlaskConical size={11} />
+            Demo
+          </button>
         )}
       </div>
     </div>

@@ -27,7 +27,6 @@ async function apiFetch<T>(
     }
     throw new Error(detail)
   }
-  // 204 No Content — return empty object
   if (res.status === 204) return {} as T
   return res.json() as Promise<T>
 }
@@ -66,6 +65,8 @@ export const configApi = {
 // Projects API
 // ---------------------------------------------------------------------------
 
+export type ProjectStage = 'hypothesis' | 'setup' | 'run'
+
 export interface Project {
   id: number
   name: string
@@ -74,7 +75,7 @@ export interface Project {
   workspace_path: string
   conda_env: string
   experiment_folder: string
-  current_stage: 'hypothesis' | 'setup' | 'run'
+  current_stage: ProjectStage
   auto_approve: boolean
   status: string
 }
@@ -101,6 +102,101 @@ export const projectsApi = {
 
   delete: (id: number) =>
     apiFetch<void>(`/api/projects/${id}`, { method: 'DELETE' }),
+
+  setAutoApprove: (id: number, auto_approve: boolean) =>
+    apiFetch<{ status: string; auto_approve: boolean }>(
+      `/api/projects/${id}/auto_approve`,
+      { method: 'POST', body: JSON.stringify({ auto_approve }) }
+    ),
+}
+
+// ---------------------------------------------------------------------------
+// Messages API
+// ---------------------------------------------------------------------------
+
+export type MessageRole = 'user' | 'assistant' | 'system' | 'tool'
+export type MessageKind = 'chat' | 'plan' | 'result' | 'error' | 'thinking'
+
+export interface Message {
+  id: number
+  project_id: number
+  role: MessageRole
+  content: string
+  created_at: string
+  kind: MessageKind
+  metadata_json: string
+}
+
+export const messagesApi = {
+  list: (projectId: number, limit = 200, offset = 0) =>
+    apiFetch<Message[]>(
+      `/api/projects/${projectId}/messages/?limit=${limit}&offset=${offset}`
+    ),
+
+  create: (
+    projectId: number,
+    data: { role: MessageRole; content: string; kind?: MessageKind; metadata_json?: string }
+  ) =>
+    apiFetch<Message>(`/api/projects/${projectId}/messages/`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+}
+
+// ---------------------------------------------------------------------------
+// Experiments API
+// ---------------------------------------------------------------------------
+
+export type ExperimentStatus = 'planned' | 'running' | 'done' | 'failed'
+export type VersionMode = 'modify' | 'branch'
+
+export interface Experiment {
+  id: number
+  project_id: number
+  iteration: number
+  git_commit: string
+  code_path: string
+  dataset_hash: string
+  conda_snapshot_path: string
+  seed: number
+  status: ExperimentStatus
+  started_at: string | null
+  finished_at: string | null
+  runtime_seconds: number | null
+  version_mode: VersionMode
+  plan_json: string
+}
+
+export const experimentsApi = {
+  list: (projectId: number) =>
+    apiFetch<Experiment[]>(`/api/projects/${projectId}/experiments`),
+
+  create: (
+    projectId: number,
+    data: { iteration?: number; seed?: number; plan_json?: string; version_mode?: VersionMode }
+  ) =>
+    apiFetch<Experiment>(`/api/projects/${projectId}/experiments`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  approve: (projectId: number, expId: number, editedPlan?: Record<string, unknown>) =>
+    apiFetch<{ status: string; experiment_id: number }>(
+      `/api/projects/${projectId}/experiments/${expId}/approve`,
+      { method: 'POST', body: JSON.stringify({ edited_plan: editedPlan ?? null }) }
+    ),
+
+  reject: (projectId: number, expId: number, feedback: string) =>
+    apiFetch<{ status: string; experiment_id: number; feedback: string }>(
+      `/api/projects/${projectId}/experiments/${expId}/reject`,
+      { method: 'POST', body: JSON.stringify({ feedback }) }
+    ),
+
+  update: (projectId: number, expId: number, data: Partial<Experiment>) =>
+    apiFetch<Experiment>(`/api/projects/${projectId}/experiments/${expId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +223,7 @@ export interface OllamaHealth {
 
 export interface LocalModel {
   name: string
-  size: number // bytes
+  size: number
   modified_at: string
   digest: string
   details?: {
@@ -165,11 +261,8 @@ export interface LocalModelsResponse {
 
 export const modelsApi = {
   getHardware: () => apiFetch<HardwareInfo>('/api/models/hardware'),
-
   getHealth: () => apiFetch<OllamaHealth>('/api/models/health'),
-
   getLocal: () => apiFetch<LocalModelsResponse>('/api/models/local'),
-
   getRecommended: () => apiFetch<RecommendedResponse>('/api/models/recommended'),
 
   pull: (model_name: string, project_id = 'global') =>

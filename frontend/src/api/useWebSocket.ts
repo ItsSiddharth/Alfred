@@ -1,12 +1,11 @@
 /**
  * api/useWebSocket.ts — WebSocket hook for a single project connection.
  *
- * Connects to ws://localhost:8000/ws/project/{projectId} when projectId is set.
- * Parses incoming JSON envelopes and routes them to the Zustand store.
- *
- * Outbound messages are dispatched via the custom DOM event `alfred:send`.
- * ChatBar fires: window.dispatchEvent(new CustomEvent('alfred:send', { detail: {...} }))
- * This hook forwards that detail object as JSON to the WebSocket.
+ * Stage 2 additions:
+ *  - Routes `state_change` events to progress strip
+ *  - Routes `approval_request` events to store.setApprovalRequest
+ *  - Routes `log` / `thinking` events to store.appendLogToken
+ *  - Routes `plan` events into the persisted message stream
  *
  * Auto-reconnects on unexpected close (up to 5 attempts, exponential backoff).
  */
@@ -23,7 +22,16 @@ export function useWebSocket(projectId: number | null) {
   const retryCountRef = useRef(0)
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const { setProgress, appendToken, finaliseStream, resetProgress } = useStore()
+  const {
+    setProgress,
+    appendToken,
+    finaliseStream,
+    resetProgress,
+    setApprovalRequest,
+    appendLogToken,
+    finaliseLog,
+    appendPersistedMessage,
+  } = useStore()
   const queryClient = useQueryClient()
 
   useEffect(() => {
@@ -54,6 +62,7 @@ export function useWebSocket(projectId: number | null) {
         const { type, payload } = envelope
 
         switch (type) {
+          // ── Progress ────────────────────────────────────────────────────
           case 'progress':
             setProgress({
               stage: (payload.stage as number) ?? 1,
@@ -61,53 +70,112 @@ export function useWebSocket(projectId: number | null) {
               label: (payload.label as string) ?? '',
               current: (payload.current as number) ?? 0,
               total: (payload.total as number) ?? 0,
-              status: (payload.status as 'running' | 'waiting' | 'error' | 'done' | 'idle') ?? 'running',
+              status:
+                (payload.status as
+                  | 'running'
+                  | 'waiting'
+                  | 'error'
+                  | 'done'
+                  | 'idle') ?? 'running',
             })
             break
 
+          // ── State change — update progress strip substage label ─────────
+          case 'state_change':
+            setProgress({
+              stage: (payload.stage as number) ?? undefined,
+              substage: (payload.substage as string) ?? '',
+              label: (payload.label as string) ?? '',
+              status: 'running',
+            })
+            break
+
+          // ── Token streaming ─────────────────────────────────────────────
           case 'token': {
             const messageId = (payload.message_id as string) || 'stream'
             const token = (payload.token as string) || ''
-            if (token) appendToken(messageId, token)
+            const kind = (payload.kind as string) || 'chat'
+            if (token) {
+              if (kind === 'thinking') {
+                appendLogToken(messageId, token, 'thinking', 'thinking')
+              } else {
+                appendToken(messageId, token)
+              }
+            }
             break
           }
 
+          // ── Done ────────────────────────────────────────────────────────
           case 'done': {
-            // Finalise all active streaming messages.
             const streams = useStore.getState().streamingMessages
             Object.keys(streams).forEach((id) => finaliseStream(id))
-            setProgress({ status: 'done', label: (payload.summary as string) || 'Done' })
+            const logs = useStore.getState().logEntries
+            Object.keys(logs).forEach((id) => finaliseLog(id))
+            setProgress({
+              status: 'done',
+              label: (payload.summary as string) || 'Done',
+            })
             break
           }
 
-          case 'error':
-            console.error('[WS] Error event:', payload)
-            setProgress({ status: 'error', label: (payload.message as string) || 'Error' })
+          // ── Approval request ────────────────────────────────────────────
+          case 'approval_request':
+            setApprovalRequest({
+              stage: (payload.stage as number) ?? 1,
+              substage: (payload.substage as string) ?? '',
+              plan: (payload.plan as Record<string, unknown>) ?? {},
+              auto_approve: (payload.auto_approve as boolean) ?? false,
+              experiment_id: (payload.experiment_id as number) ?? undefined,
+            })
             break
 
+          // ── Log / thinking events ───────────────────────────────────────
+          case 'log': {
+            const msgId = (payload.message_id as string) || `log-${Date.now()}`
+            const content = (payload.message as string) || (payload.content as string) || ''
+            const phase = (payload.phase as string) || 'log'
+            const logKind = (payload.kind as string) === 'thinking' ? 'thinking' : 'log'
+            if (content) appendLogToken(msgId, content, phase, logKind as 'thinking' | 'log')
+            break
+          }
+
+          // ── Plan card ───────────────────────────────────────────────────
+          case 'plan': {
+            // Plans are surfaced via the approval_request flow; also log them.
+            console.info('[WS] plan:', payload)
+            break
+          }
+
+          // ── Error ───────────────────────────────────────────────────────
+          case 'error':
+            console.error('[WS] Error event:', payload)
+            setProgress({
+              status: 'error',
+              label: (payload.message as string) || 'Error',
+            })
+            break
+
+          // ── Result ─────────────────────────────────────────────────────
           case 'result':
-            // Handle model_pulled result — refresh local model list.
             if ((payload as { kind?: string }).kind === 'model_pulled') {
               queryClient.invalidateQueries({ queryKey: ['local-models'] })
               queryClient.invalidateQueries({ queryKey: ['ollama-health'] })
-              // Remove from pulling set.
               const model = payload.model as string
               if (model) useStore.getState().removePullingModel(model)
             }
             break
 
-          case 'state_change':
-            // Stage 2 will route this properly.
-            console.info('[WS] state_change:', payload)
+          // ── Tool call (Stage 4+) ────────────────────────────────────────
+          case 'tool_call': {
+            const tcId = (payload.tool_call_id as string) || `tc-${Date.now()}`
+            const summary = `[Tool: ${payload.tool_name}] ${payload.query ?? ''}`
+            appendLogToken(tcId, summary, 'tool', 'tool_call')
             break
+          }
 
-          case 'log':
-          case 'plan':
-          case 'approval_request':
-          case 'tool_call':
+          // ── Plot (Stage 7+) ─────────────────────────────────────────────
           case 'plot':
-            // Handled in later stages.
-            console.info(`[WS] ${type}:`, payload)
+            console.info('[WS] plot received:', payload)
             break
 
           default:
@@ -122,7 +190,6 @@ export function useWebSocket(projectId: number | null) {
           console.info('[WS] Closed cleanly')
           return
         }
-        // Unexpected close — retry with exponential backoff.
         if (retryCountRef.current < MAX_RETRIES) {
           const delay = Math.min(1000 * 2 ** retryCountRef.current, 15000)
           retryCountRef.current += 1
@@ -135,13 +202,11 @@ export function useWebSocket(projectId: number | null) {
 
       ws.onerror = (evt) => {
         console.warn('[WS] Socket error:', evt)
-        // onclose will fire next and handle the retry.
       }
     }
 
     connect()
 
-    // Forward alfred:send DOM events to the WebSocket.
     function handleSendEvent(e: Event) {
       const detail = (e as CustomEvent).detail
       if (wsRef.current?.readyState === WebSocket.OPEN) {

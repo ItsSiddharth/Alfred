@@ -1,11 +1,11 @@
 /**
- * Fixed left sidebar — ~280px wide per C5.
+ * Sidebar — Stage 2 edition.
  *
- * Top section: Memory | Tools | Find models panel nav items.
- * When a nav item is active, a panel drawer opens to the right of the sidebar.
- * Bottom section: project list + New project button.
- *
- * Stage 1: FindModelsPanel is real. Memory and Tools are stubs (Stage 3/4).
+ * New in Stage 2:
+ *  - On project select: fetches message history from DB and populates store
+ *  - Auto-approve toggle per project (calls POST /api/projects/{id}/auto_approve)
+ *  - Project current_stage colour-coded dot
+ *  - Panel drawer includes FindModelsPanel (real), Memory/Tools (stubs)
  */
 
 import React, { useState } from 'react'
@@ -17,9 +17,11 @@ import {
   FolderOpen,
   ChevronRight,
   X,
+  Zap,
+  ZapOff,
 } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { projectsApi, type Project } from '../../api/client'
+import { projectsApi, messagesApi, type Project } from '../../api/client'
 import { useStore, type SidebarPanel } from '../../store'
 import { Button } from '../common/Button'
 import { FindModelsPanel } from './FindModelsPanel'
@@ -58,7 +60,6 @@ function NavItem({ icon, label, panel }: NavItemProps) {
 
 function PanelDrawer({ panel }: { panel: SidebarPanel }) {
   const { setSidebarPanel } = useStore()
-
   if (!panel) return null
 
   const titles: Record<NonNullable<SidebarPanel>, string> = {
@@ -70,11 +71,13 @@ function PanelDrawer({ panel }: { panel: SidebarPanel }) {
   const renderContent = () => {
     if (panel === 'find-models') return <FindModelsPanel />
 
-    // Stubs for Stage 3 (memory) and Stage 4 (tools)
     const descriptions: Record<string, string> = {
-      memory: 'Memory engine — built in Stage 3. Will show remembered facts, preferences, and dataset references.',
-      tools: 'Tool bus — built in Stage 4. Will show registered tools, enable/disable toggles, and recent call logs.',
+      memory:
+        'Memory engine — built in Stage 3. Will show remembered facts, preferences, and dataset references.',
+      tools:
+        'Tool bus — built in Stage 4. Will show registered tools, enable/disable toggles, and recent call logs.',
     }
+
     return (
       <div className="flex flex-col h-full">
         <div
@@ -94,10 +97,7 @@ function PanelDrawer({ panel }: { panel: SidebarPanel }) {
         </div>
         <div className="flex-1 flex items-center justify-center p-6 text-center">
           <div>
-            <div
-              className="text-sm font-medium mb-2"
-              style={{ color: 'var(--text-secondary)' }}
-            >
+            <div className="text-sm font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>
               {titles[panel]}
             </div>
             <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
@@ -111,16 +111,58 @@ function PanelDrawer({ panel }: { panel: SidebarPanel }) {
 
   return (
     <div
-      className="flex flex-col h-full"
+      className="flex flex-col h-full shrink-0"
       style={{
         width: '300px',
         backgroundColor: 'var(--bg-surface)',
         borderRight: '1px solid var(--border)',
-        flexShrink: 0,
       }}
     >
       {renderContent()}
     </div>
+  )
+}
+
+// ── Auto-approve toggle ───────────────────────────────────────────────────
+
+interface AutoApproveToggleProps {
+  project: Project
+}
+
+function AutoApproveToggle({ project }: AutoApproveToggleProps) {
+  const queryClient = useQueryClient()
+
+  const mutation = useMutation({
+    mutationFn: (value: boolean) =>
+      projectsApi.setAutoApprove(project.id, value),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['projects'] })
+    },
+  })
+
+  return (
+    <button
+      onClick={() => mutation.mutate(!project.auto_approve)}
+      disabled={mutation.isPending}
+      className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors disabled:opacity-40"
+      title={
+        project.auto_approve
+          ? 'Auto-approve on — click to require manual approval'
+          : 'Auto-approve off — click to auto-approve plans'
+      }
+      style={{
+        color: project.auto_approve ? 'var(--warn)' : 'var(--text-tertiary)',
+        borderColor: project.auto_approve
+          ? 'rgba(245,158,11,0.4)'
+          : 'var(--border)',
+        backgroundColor: project.auto_approve
+          ? 'rgba(245,158,11,0.07)'
+          : 'transparent',
+      }}
+    >
+      {project.auto_approve ? <Zap size={10} /> : <ZapOff size={10} />}
+      {project.auto_approve ? 'Auto' : 'Manual'}
+    </button>
   )
 }
 
@@ -129,7 +171,7 @@ function PanelDrawer({ panel }: { panel: SidebarPanel }) {
 interface ProjectItemProps {
   project: Project
   isActive: boolean
-  onSelect: (id: number) => void
+  onSelect: (project: Project) => void
 }
 
 function ProjectItem({ project, isActive, onSelect }: ProjectItemProps) {
@@ -140,37 +182,53 @@ function ProjectItem({ project, isActive, onSelect }: ProjectItemProps) {
   }
 
   return (
-    <button
-      onClick={() => onSelect(project.id)}
-      className="w-full flex items-start gap-2 px-3 py-2 rounded text-left transition-colors duration-100"
+    <div
+      className="rounded transition-colors duration-100"
       style={{
         backgroundColor: isActive ? 'var(--bg-elevated)' : 'transparent',
         border: isActive ? '1px solid var(--border)' : '1px solid transparent',
       }}
     >
-      <FolderOpen
-        size={14}
-        className="mt-0.5 shrink-0"
-        style={{ color: isActive ? 'var(--accent)' : 'var(--text-tertiary)' }}
-      />
-      <div className="flex-1 min-w-0">
-        <div
-          className="text-sm truncate"
-          style={{ color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)' }}
-        >
-          {project.name}
+      <button
+        onClick={() => onSelect(project)}
+        className="w-full flex items-start gap-2 px-3 py-2 text-left"
+      >
+        <FolderOpen
+          size={14}
+          className="mt-0.5 shrink-0"
+          style={{ color: isActive ? 'var(--accent)' : 'var(--text-tertiary)' }}
+        />
+        <div className="flex-1 min-w-0">
+          <div
+            className="text-sm truncate"
+            style={{
+              color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+            }}
+          >
+            {project.name}
+          </div>
+          <div className="flex items-center gap-1.5 mt-0.5">
+            <span
+              className="w-1.5 h-1.5 rounded-full shrink-0"
+              style={{
+                backgroundColor:
+                  stageColors[project.current_stage] ?? 'var(--text-tertiary)',
+              }}
+            />
+            <span className="text-xs truncate" style={{ color: 'var(--text-tertiary)' }}>
+              {project.current_stage}
+            </span>
+          </div>
         </div>
-        <div className="flex items-center gap-1.5 mt-0.5">
-          <span
-            className="w-1.5 h-1.5 rounded-full shrink-0"
-            style={{ backgroundColor: stageColors[project.current_stage] ?? 'var(--text-tertiary)' }}
-          />
-          <span className="text-xs truncate" style={{ color: 'var(--text-tertiary)' }}>
-            {project.current_stage}
-          </span>
+      </button>
+
+      {/* Auto-approve toggle — only visible for active project */}
+      {isActive && (
+        <div className="flex justify-end px-3 pb-2">
+          <AutoApproveToggle project={project} />
         </div>
-      </div>
-    </button>
+      )}
+    </div>
   )
 }
 
@@ -178,18 +236,18 @@ function ProjectItem({ project, isActive, onSelect }: ProjectItemProps) {
 
 interface NewProjectFormProps {
   onDone: () => void
+  onCreated: (project: Project) => void
 }
 
-function NewProjectForm({ onDone }: NewProjectFormProps) {
+function NewProjectForm({ onDone, onCreated }: NewProjectFormProps) {
   const [name, setName] = useState('')
   const queryClient = useQueryClient()
-  const { setActiveProjectId } = useStore()
 
   const mutation = useMutation({
     mutationFn: () => projectsApi.create({ name: name.trim() }),
     onSuccess: (project) => {
       queryClient.invalidateQueries({ queryKey: ['projects'] })
-      setActiveProjectId(project.id)
+      onCreated(project)
       onDone()
     },
   })
@@ -238,13 +296,30 @@ function NewProjectForm({ onDone }: NewProjectFormProps) {
 // ── Sidebar ────────────────────────────────────────────────────────────────
 
 export function Sidebar() {
-  const { activeProjectId, setActiveProjectId, sidebarPanel } = useStore()
+  const { activeProjectId, setActiveProjectId, setPersistedMessages, sidebarPanel } =
+    useStore()
   const [showNewForm, setShowNewForm] = useState(false)
 
   const { data: projects = [], isLoading } = useQuery({
     queryKey: ['projects'],
     queryFn: projectsApi.list,
   })
+
+  // When a project is selected: set active + load message history
+  const handleSelectProject = async (project: Project) => {
+    setActiveProjectId(project.id)
+    try {
+      const msgs = await messagesApi.list(project.id, 200)
+      setPersistedMessages(msgs)
+    } catch (err) {
+      console.warn('[Sidebar] Failed to load messages:', err)
+      setPersistedMessages([])
+    }
+  }
+
+  const handleCreated = (project: Project) => {
+    handleSelectProject(project)
+  }
 
   return (
     <>
@@ -273,7 +348,7 @@ export function Sidebar() {
           </span>
         </div>
 
-        {/* Top nav — Memory / Tools / Find models */}
+        {/* Top nav */}
         <nav className="flex flex-col gap-0.5 px-2 py-3">
           <NavItem icon={<BrainCircuit size={15} />} label="Memory" panel="memory" />
           <NavItem icon={<Wrench size={15} />} label="Tools" panel="tools" />
@@ -282,7 +357,7 @@ export function Sidebar() {
 
         <div className="mx-3 border-t" style={{ borderColor: 'var(--border)' }} />
 
-        {/* Project history — fills remaining space */}
+        {/* Project history */}
         <div className="flex flex-col flex-1 min-h-0 pt-3">
           <div className="flex items-center justify-between px-3 mb-2">
             <span className="text-sm font-medium" style={{ color: 'var(--text-tertiary)' }}>
@@ -299,7 +374,12 @@ export function Sidebar() {
             </button>
           </div>
 
-          {showNewForm && <NewProjectForm onDone={() => setShowNewForm(false)} />}
+          {showNewForm && (
+            <NewProjectForm
+              onDone={() => setShowNewForm(false)}
+              onCreated={handleCreated}
+            />
+          )}
 
           <div className="flex-1 overflow-y-auto px-2 pb-3 flex flex-col gap-0.5">
             {isLoading && (
@@ -317,14 +397,14 @@ export function Sidebar() {
                 key={p.id}
                 project={p}
                 isActive={p.id === activeProjectId}
-                onSelect={setActiveProjectId}
+                onSelect={handleSelectProject}
               />
             ))}
           </div>
         </div>
       </aside>
 
-      {/* Panel drawer — slides in beside sidebar */}
+      {/* Panel drawer */}
       <PanelDrawer panel={sidebarPanel} />
     </>
   )
