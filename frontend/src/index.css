@@ -1,0 +1,116 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── C5 Design Tokens ─────────────────────────────────────────────────────── */
+:root {
+  --bg-base:       #0A0E14;
+  --bg-surface:    #111721;
+  --bg-elevated:   #1A2230;
+  --bg-inset:      #070A0F;
+  --border:        #232B3A;
+  --border-strong: #313C4F;
+
+  --text-primary:   #E6EDF3;
+  --text-secondary: #8B98A9;
+  --text-tertiary:  #5A6577;
+
+  --accent:        #38BDF8;
+  --accent-hover:  #7DD3FC;
+  --running:       #34D399;
+  --warn:          #F59E0B;
+  --danger:        #EF4444;
+  --success:       #22C55E;
+  --info:          #A78BFA;
+}
+
+/* ── Base reset ───────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  font-weight: 400;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+code, pre, .font-mono {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/* ── Scrollbar styling ───────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* ── Prose (markdown rendering) ──────────────────────────────────────────── */
+.prose-invert {
+  color: var(--text-primary);
+}
+.prose-invert h1, .prose-invert h2, .prose-invert h3 {
+  color: var(--text-primary);
+  font-weight: 500;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
+.prose-invert p { margin: 0.5em 0; }
+.prose-invert code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+  background: var(--bg-inset);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--accent);
+}
+.prose-invert pre {
+  background: var(--bg-inset) !important;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1em;
+  overflow-x: auto;
+  margin: 0.75em 0;
+}
+.prose-invert pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: 0.82em;
+}
+.prose-invert a { color: var(--accent); }
+.prose-invert a:hover { color: var(--accent-hover); }
+.prose-invert ul, .prose-invert ol { padding-left: 1.5em; margin: 0.5em 0; }
+.prose-invert li { margin: 0.2em 0; }
+.prose-invert blockquote {
+  border-left: 2px solid var(--accent);
+  padding-left: 1em;
+  margin: 0.5em 0;
+  color: var(--text-secondary);
+}
+.prose-invert strong { color: var(--text-primary); font-weight: 500; }
+.prose-xs { font-size: 0.75rem; }
+.prose-sm { font-size: 0.875rem; }
+
+/* ── Highlight.js theme override (inset code blocks) ─────────────────────── */
+.hljs { background: var(--bg-inset) !important; color: var(--text-primary); }
+.hljs-keyword  { color: var(--info); }
+.hljs-string   { color: var(--running); }
+.hljs-comment  { color: var(--text-tertiary); font-style: italic; }
+.hljs-number   { color: var(--warn); }
+.hljs-function { color: var(--accent); }
+.hljs-title    { color: var(--accent-hover); }
+.hljs-built_in { color: var(--accent); }
+.hljs-attr     { color: var(--warn); }
+
+/* ── Utility ─────────────────────────────────────────────────────────────── */
+.select-none { user-select: none; }

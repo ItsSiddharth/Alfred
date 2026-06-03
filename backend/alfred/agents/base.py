@@ -15,6 +15,9 @@ Usage:
 
 The system prompt for the chosen role is automatically prepended; callers
 should NOT include their own system message in `messages`.
+
+chat_raw() is a low-level streaming method used by ToolDispatcher to get
+structured JSON responses without the role system prompt prepended.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, AsyncIterator
 
 from alfred.services.ollama import OllamaError, stream_chat
 
@@ -46,7 +49,6 @@ class Role(str, Enum):
 
 
 # System prompt templates for each role.
-# These are prepended to every conversation as the "system" message.
 _SYSTEM_PROMPTS: dict[Role, str] = {
     Role.RESEARCHER: """\
 You are ALFRED's researcher persona — a rigorous, methodical ML research assistant.
@@ -197,7 +199,7 @@ class LLMClient:
     ) -> str:
         """
         Same as chat() but never emits WS events.
-        Useful for internal tool-use calls.
+        Useful for internal tool-use and memory compilation calls.
         """
         system_content = _SYSTEM_PROMPTS[role]
         if extra_system:
@@ -214,6 +216,52 @@ class LLMClient:
             project_id="",     # suppresses WS routing
             message_id="",
             ws_manager=None,   # suppresses token broadcast
+            options=self.options or None,
+        )
+
+    async def chat_raw(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        *,
+        stream: bool = False,
+    ) -> str:
+        """
+        Low-level chat call with a custom system prompt (no role prepending).
+
+        Used by ToolDispatcher to get structured JSON decisions without the
+        researcher/coder/etc. persona bleeding in.
+
+        Always collects the full response and returns it as a string.
+        Never emits WS token events (silent by design — tool decisions are
+        internal and surfaced via tool_call events instead).
+
+        Args:
+            system_prompt: Raw system prompt string (may be empty).
+            messages:      Conversation history as dicts with role/content.
+            stream:        Unused — kept for call-site compatibility. Always
+                           collects full response regardless.
+
+        Returns the complete assistant text response.
+        Raises OllamaError on Ollama failure.
+        """
+        full_messages: list[dict[str, str]] = []
+        if system_prompt:
+            full_messages.append({"role": "system", "content": system_prompt})
+        full_messages.extend(messages)
+
+        logger.debug(
+            "LLMClient.chat_raw model=%s messages=%d",
+            self.model,
+            len(full_messages),
+        )
+
+        return await stream_chat(
+            self.model,
+            full_messages,
+            project_id="",    # never emit tokens to WS — tool decisions are internal
+            message_id="",
+            ws_manager=None,
             options=self.options or None,
         )
 

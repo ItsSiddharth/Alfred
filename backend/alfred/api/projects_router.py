@@ -1,12 +1,13 @@
 """
-/api/projects router.
+/api/projects router — project CRUD.
 
-Full CRUD for Project rows.  Projects are the top-level container for
-everything in ALFRED: messages, experiments, memory, scores.
+Note: POST /auto_approve lives in experiments_router.py (it also controls the
+live state machine). This file is CRUD-only to avoid duplicate route registration.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import List, Optional
@@ -16,15 +17,12 @@ from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from alfred.db import get_session
-from alfred.models.db_models import Project, ProjectStage
+from alfred.models.db_models import (
+    Experiment, MemoryItem, Message, Project, ProjectStage, Score, ToolCall,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
-
-
-# ---------------------------------------------------------------------------
-# Pydantic I/O shapes (separate from SQLModel table models)
-# ---------------------------------------------------------------------------
 
 
 class ProjectCreate(BaseModel):
@@ -56,15 +54,14 @@ class ProjectResponse(BaseModel):
     status: str
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-
 @router.get("/", response_model=List[ProjectResponse])
 async def list_projects(session: Session = Depends(get_session)) -> list:
-    """Return all projects ordered newest first."""
-    projects = session.exec(select(Project).order_by(Project.created_at.desc())).all()
+    """Return all non-deleted projects ordered newest first."""
+    projects = session.exec(
+        select(Project)
+        .where(Project.status != "deleted")
+        .order_by(Project.created_at.desc())
+    ).all()
     return projects
 
 
@@ -72,7 +69,6 @@ async def list_projects(session: Session = Depends(get_session)) -> list:
 async def create_project(
     req: ProjectCreate, session: Session = Depends(get_session)
 ) -> Project:
-    """Create a new project."""
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="Project name must not be empty")
     project = Project(
@@ -89,9 +85,11 @@ async def create_project(
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
-async def get_project(project_id: int, session: Session = Depends(get_session)) -> Project:
+async def get_project(
+    project_id: int, session: Session = Depends(get_session)
+) -> Project:
     project = session.get(Project, project_id)
-    if project is None:
+    if project is None or project.status == "deleted":
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
@@ -101,7 +99,7 @@ async def update_project(
     project_id: int, req: ProjectUpdate, session: Session = Depends(get_session)
 ) -> Project:
     project = session.get(Project, project_id)
-    if project is None:
+    if project is None or project.status == "deleted":
         raise HTTPException(status_code=404, detail="Project not found")
     data = req.model_dump(exclude_none=True)
     for field, value in data.items():
@@ -117,9 +115,53 @@ async def update_project(
 async def delete_project(
     project_id: int, session: Session = Depends(get_session)
 ) -> None:
+    """
+    Soft-delete a project (status='deleted') and hard-delete all child rows.
+
+    Child tables deleted: Message, MemoryItem, Experiment, Score, ToolCall.
+    The project row itself is kept with status='deleted' so referential integrity
+    is preserved for any foreign keys in existing data.
+    """
     project = session.get(Project, project_id)
-    if project is None:
+    if project is None or project.status == "deleted":
         raise HTTPException(status_code=404, detail="Project not found")
-    session.delete(project)
+
+    for model_cls in [Message, MemoryItem, Experiment, Score, ToolCall]:
+        try:
+            records = session.exec(
+                select(model_cls).where(model_cls.project_id == project_id)
+            ).all()
+            for rec in records:
+                session.delete(rec)
+        except Exception as exc:
+            logger.warning(
+                "Could not delete %s records for project %s: %s",
+                model_cls.__name__, project_id, exc,
+            )
+
+    project.status = "deleted"
+    project.updated_at = datetime.utcnow()
+    session.add(project)
     session.commit()
     logger.info("Project deleted: id=%s", project_id)
+
+
+@router.post("/{project_id}/auto_approve")
+async def toggle_auto_approve(
+    project_id: int, session: Session = Depends(get_session)
+) -> dict:
+    """
+    Toggle auto-approve (flip current value) and return the new value.
+
+    This lightweight version is called by the Sidebar toggle button which
+    doesn't know the current value. The experiments_router version accepts
+    an explicit boolean and also syncs the live state machine.
+    """
+    project = session.get(Project, project_id)
+    if project is None or project.status == "deleted":
+        raise HTTPException(status_code=404, detail="Project not found")
+    project.auto_approve = not project.auto_approve
+    project.updated_at = datetime.utcnow()
+    session.add(project)
+    session.commit()
+    return {"status": "ok", "auto_approve": project.auto_approve}

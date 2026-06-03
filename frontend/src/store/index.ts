@@ -1,20 +1,17 @@
 /**
- * Global Zustand store — Stage 2 edition.
+ * Global Zustand store — Stage 4 (patched).
  *
- * New in Stage 2:
- *  - persistedMessages: Message[] loaded from DB on project open
- *  - approvalRequest: the pending plan card data (from WS approval_request event)
- *  - showWorkMode: "show your work" toggle — expands thinking tabs inline
- *  - activeExperimentId: tracks the current experiment row
- *  - per-project model selection (model stored keyed by projectId)
- *
- * Streaming tokens still accumulate in streamingMessages; on WS `done` they
- * are finalised in place. The ChatThread renders both persisted + streaming.
+ * Key fixes vs original Stage 4:
+ *  - clearProjectState() now resets streamingMsgId (F3)
+ *  - appendPersistedMessage() guards against duplicate IDs (F1 partial fix)
+ *  - finaliseStream() removes the entry from streamingMessages entirely
+ *    instead of just marking isStreaming=false, preventing double-render (F1)
+ *  - setActiveProjectId clears streamingMsgId on project switch
  */
 
 import { create } from 'zustand'
 
-// ── Re-exported types ─────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────
 
 export type SidebarPanel = 'memory' | 'tools' | 'find-models' | null
 
@@ -34,7 +31,6 @@ export interface StreamingMessage {
   kind: MessageKind
 }
 
-// Mirrors backend MessageKind enum
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool'
 export type MessageKind = 'chat' | 'plan' | 'result' | 'error' | 'thinking'
 
@@ -64,68 +60,107 @@ export interface LogEntry {
   isStreaming: boolean
 }
 
+export interface ToolCallEvent {
+  tool_name: string
+  input?: Record<string, unknown>
+  reason?: string
+  status: 'running' | 'done' | 'error'
+  sources?: string[]
+  error?: string | null
+  result_count?: number
+  ts: string
+}
+
 // ── Store interface ────────────────────────────────────────────────────────
 
 export interface AlfredStore {
-  // ── Setup ──────────────────────────────────────────────────────────────
+  // Setup
   configStatus: 'unknown' | 'needs_setup' | 'configured'
   setConfigStatus: (s: AlfredStore['configStatus']) => void
 
-  // ── Active project ─────────────────────────────────────────────────────
+  // Active project
   activeProjectId: number | null
   setActiveProjectId: (id: number | null) => void
 
-  // ── Active experiment ──────────────────────────────────────────────────
+  // Active experiment
   activeExperimentId: number | null
   setActiveExperimentId: (id: number | null) => void
 
-  // ── Sidebar ────────────────────────────────────────────────────────────
+  // Sidebar
   sidebarPanel: SidebarPanel
   setSidebarPanel: (panel: SidebarPanel) => void
 
-  // ── Selected model (per-project map + convenience getter) ──────────────
+  // Selected model
   selectedModel: string
   setSelectedModel: (model: string) => void
   projectModels: Record<number, string>
   setProjectModel: (projectId: number, model: string) => void
 
-  // ── Pulling models ─────────────────────────────────────────────────────
+  // Pulling models
   pullingModels: Set<string>
   addPullingModel: (tag: string) => void
   removePullingModel: (tag: string) => void
 
-  // ── Progress strip ─────────────────────────────────────────────────────
+  // Progress strip
   progress: ProgressState
   setProgress: (p: Partial<ProgressState>) => void
   resetProgress: () => void
 
-  // ── Persisted messages (loaded from DB on project open) ────────────────
+  // Persisted messages (loaded from DB on project open)
   persistedMessages: PersistedMessage[]
   setPersistedMessages: (msgs: PersistedMessage[]) => void
+  /**
+   * Append a message to persistedMessages, guarding against duplicate IDs.
+   * If a message with the same id already exists, it is updated in place.
+   */
   appendPersistedMessage: (msg: PersistedMessage) => void
+  /**
+   * Patch a persisted message's content in place (used during streaming).
+   * No-op if message with given id is not found.
+   */
+  patchPersistedMessage: (id: number, content: string) => void
 
-  // ── Streaming tokens ───────────────────────────────────────────────────
+  // Streaming token buffers (keyed by message_id string)
+  // NOTE: these are ONLY used for messages that don't yet have a DB row id.
+  // Once msg_start is received, tokens go into persistedMessages instead.
   streamingMessages: Record<string, StreamingMessage>
   appendToken: (messageId: string, token: string, kind?: MessageKind) => void
+  /**
+   * Remove the streaming entry (don't just mark done — removal prevents
+   * the double-render bug where ChatThread renders both streamingMessages
+   * and persistedMessages for the same content).
+   */
   finaliseStream: (messageId: string) => void
   clearStreams: () => void
 
-  // ── Inline log / thinking entries ──────────────────────────────────────
+  // Which DB row is currently being streamed into
+  streamingMsgId: number | null
+  setStreamingMsgId: (id: number | null) => void
+
+  // Inline log / thinking entries
   logEntries: Record<string, LogEntry>
   appendLogToken: (messageId: string, token: string, phase: string, kind: LogEntry['kind']) => void
   finaliseLog: (messageId: string) => void
   clearLogs: () => void
 
-  // ── Approval ───────────────────────────────────────────────────────────
+  // Approval gate
   approvalRequest: ApprovalRequest | null
   setApprovalRequest: (req: ApprovalRequest | null) => void
 
-  // ── "Show your work" toggle ────────────────────────────────────────────
+  // Show-your-work toggle
   showWorkMode: boolean
   toggleShowWork: () => void
-}
 
-// ── Default progress state ────────────────────────────────────────────────
+  // Tool call events (live feed from WS)
+  toolCalls: ToolCallEvent[]
+  addToolCall: (event: ToolCallEvent) => void
+  clearToolCalls: () => void
+
+  // Project management helpers
+  deleteProjectLocal: (id: number) => void
+  /** Reset ALL ephemeral per-project state when switching projects. */
+  clearProjectState: () => void
+}
 
 const defaultProgress: ProgressState = {
   stage: 1,
@@ -136,50 +171,49 @@ const defaultProgress: ProgressState = {
   status: 'idle',
 }
 
-// ── Store ─────────────────────────────────────────────────────────────────
-
 export const useStore = create<AlfredStore>((set, get) => ({
-  // Setup
+  // ── Setup ────────────────────────────────────────────────────────────────
   configStatus: 'unknown',
   setConfigStatus: (s) => set({ configStatus: s }),
 
-  // Active project
+  // ── Active project ────────────────────────────────────────────────────────
   activeProjectId: null,
   setActiveProjectId: (id) => {
-    // When switching projects, restore the per-project model selection.
     const { projectModels } = get()
     const model = id !== null ? (projectModels[id] ?? '') : ''
     set({
       activeProjectId: id,
       selectedModel: model,
+      // Clear ALL per-project ephemeral state on project switch
       persistedMessages: [],
       streamingMessages: {},
       logEntries: {},
       approvalRequest: null,
       activeExperimentId: null,
+      streamingMsgId: null,   // F3 fix
+      toolCalls: [],
+      progress: defaultProgress,
     })
   },
 
-  // Active experiment
   activeExperimentId: null,
   setActiveExperimentId: (id) => set({ activeExperimentId: id }),
 
-  // Sidebar
+  // ── Sidebar ────────────────────────────────────────────────────────────────
   sidebarPanel: null,
   setSidebarPanel: (panel) =>
-    set((state) => ({
-      sidebarPanel: state.sidebarPanel === panel ? null : panel,
-    })),
+    set((state) => ({ sidebarPanel: state.sidebarPanel === panel ? null : panel })),
 
-  // Model (per-project)
+  // ── Model selection ────────────────────────────────────────────────────────
   selectedModel: '',
   setSelectedModel: (model) => {
     const { activeProjectId } = get()
     set((state) => ({
       selectedModel: model,
-      projectModels: activeProjectId !== null
-        ? { ...state.projectModels, [activeProjectId]: model }
-        : state.projectModels,
+      projectModels:
+        activeProjectId !== null
+          ? { ...state.projectModels, [activeProjectId]: model }
+          : state.projectModels,
     }))
   },
   projectModels: {},
@@ -188,35 +222,51 @@ export const useStore = create<AlfredStore>((set, get) => ({
       projectModels: { ...state.projectModels, [projectId]: model },
     })),
 
-  // Pulling models
+  // ── Pulling models ─────────────────────────────────────────────────────────
   pullingModels: new Set<string>(),
   addPullingModel: (tag) =>
-    set((state) => ({
-      pullingModels: new Set([...state.pullingModels, tag]),
-    })),
+    set((state) => ({ pullingModels: new Set([...state.pullingModels, tag]) })),
   removePullingModel: (tag) =>
     set((state) => {
-      const next = new Set(state.pullingModels)
-      next.delete(tag)
-      return { pullingModels: next }
+      const n = new Set(state.pullingModels)
+      n.delete(tag)
+      return { pullingModels: n }
     }),
 
-  // Progress
+  // ── Progress strip ─────────────────────────────────────────────────────────
   progress: defaultProgress,
   setProgress: (p) =>
     set((state) => ({ progress: { ...state.progress, ...p } })),
   resetProgress: () => set({ progress: defaultProgress }),
 
-  // Persisted messages
+  // ── Persisted messages ─────────────────────────────────────────────────────
   persistedMessages: [],
   setPersistedMessages: (msgs) => set({ persistedMessages: msgs }),
+
   appendPersistedMessage: (msg) =>
+    set((state) => {
+      // Guard: if a message with this id already exists, update it in place
+      // rather than appending a duplicate. This handles the case where the
+      // REST load and the WS msg_start arrive for the same row.
+      const existingIdx = state.persistedMessages.findIndex((m) => m.id === msg.id)
+      if (existingIdx >= 0) {
+        const updated = [...state.persistedMessages]
+        updated[existingIdx] = { ...updated[existingIdx], ...msg }
+        return { persistedMessages: updated }
+      }
+      return { persistedMessages: [...state.persistedMessages, msg] }
+    }),
+
+  patchPersistedMessage: (id, content) =>
     set((state) => ({
-      persistedMessages: [...state.persistedMessages, msg],
+      persistedMessages: state.persistedMessages.map((m) =>
+        m.id === id ? { ...m, content } : m
+      ),
     })),
 
-  // Streaming
+  // ── Streaming token buffers ────────────────────────────────────────────────
   streamingMessages: {},
+
   appendToken: (messageId, token, kind = 'chat') =>
     set((state) => {
       const existing = state.streamingMessages[messageId]
@@ -232,21 +282,25 @@ export const useStore = create<AlfredStore>((set, get) => ({
         },
       }
     }),
+
+  // F1 fix: REMOVE the entry on finalise, don't just mark isStreaming=false.
+  // This prevents ChatThread from rendering the streaming buffer alongside
+  // the now-complete persistedMessage for the same content.
   finaliseStream: (messageId) =>
     set((state) => {
-      const existing = state.streamingMessages[messageId]
-      if (!existing) return {}
-      return {
-        streamingMessages: {
-          ...state.streamingMessages,
-          [messageId]: { ...existing, isStreaming: false },
-        },
-      }
+      const { [messageId]: _removed, ...rest } = state.streamingMessages
+      return { streamingMessages: rest }
     }),
+
   clearStreams: () => set({ streamingMessages: {} }),
 
-  // Log / thinking entries
+  // ── DB row being streamed ──────────────────────────────────────────────────
+  streamingMsgId: null,
+  setStreamingMsgId: (id) => set({ streamingMsgId: id }),
+
+  // ── Log / thinking entries ─────────────────────────────────────────────────
   logEntries: {},
+
   appendLogToken: (messageId, token, phase, kind) =>
     set((state) => {
       const existing = state.logEntries[messageId]
@@ -263,6 +317,7 @@ export const useStore = create<AlfredStore>((set, get) => ({
         },
       }
     }),
+
   finaliseLog: (messageId) =>
     set((state) => {
       const existing = state.logEntries[messageId]
@@ -274,13 +329,40 @@ export const useStore = create<AlfredStore>((set, get) => ({
         },
       }
     }),
+
   clearLogs: () => set({ logEntries: {} }),
 
-  // Approval
+  // ── Approval gate ──────────────────────────────────────────────────────────
   approvalRequest: null,
   setApprovalRequest: (req) => set({ approvalRequest: req }),
 
-  // Show work
+  // ── Show-your-work ─────────────────────────────────────────────────────────
   showWorkMode: false,
-  toggleShowWork: () => set((state) => ({ showWorkMode: !state.showWorkMode })),
+  toggleShowWork: () =>
+    set((state) => ({ showWorkMode: !state.showWorkMode })),
+
+  // ── Tool calls ─────────────────────────────────────────────────────────────
+  toolCalls: [],
+  addToolCall: (event) =>
+    set((state) => ({
+      toolCalls: [event, ...state.toolCalls].slice(0, 100),
+    })),
+  clearToolCalls: () => set({ toolCalls: [] }),
+
+  // ── Project management ─────────────────────────────────────────────────────
+  deleteProjectLocal: (id) =>
+    set((state) => ({
+      activeProjectId: state.activeProjectId === id ? null : state.activeProjectId,
+    })),
+
+  clearProjectState: () =>
+    set({
+      persistedMessages: [],
+      streamingMessages: {},
+      logEntries: {},
+      approvalRequest: null,
+      streamingMsgId: null,   // F3 fix — was missing
+      toolCalls: [],
+      progress: defaultProgress,
+    }),
 }))

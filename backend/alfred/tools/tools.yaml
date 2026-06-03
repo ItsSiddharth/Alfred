@@ -1,0 +1,29 @@
+tools:
+  - name: web_search
+    module: alfred.tools.web_search
+    class: WebSearchTool
+    default_enabled: true
+    config:
+      max_results: 10
+
+  - name: arxiv_search
+    module: alfred.tools.arxiv_search
+    class: ArxivSearchTool
+    default_enabled: true
+    config:
+      max_results: 10
+      categories: [cs.LG, cs.AI, cs.CL, cs.CV, cs.NE, cs.RO, stat.ML]
+
+  - name: semantic_scholar
+    module: alfred.tools.semantic_scholar
+    class: SemanticScholarTool
+    default_enabled: true
+    config:
+      sleep_seconds: 3.5
+
+  - name: openalex_search
+    module: alfred.tools.openalex_search
+    class: OpenAlexSearchTool
+    default_enabled: true
+    config:
+      max_results: 10

@@ -1,11 +1,14 @@
 /**
- * ChatBar — bottom input bar.
+ * ChatBar — bottom input bar (Stage 4, patched).
  *
- * Stage 2 additions:
- *  - User messages are dispatched over WS (backend persists them to DB)
- *  - "Show your work" toggle button (expands thinking tabs)
- *  - Demo pipeline button (triggers scripted state machine walkthrough)
- *  - Disabled while no project is active or no model selected
+ * Fix vs original:
+ *   F6 — Optimistic user message uses a large negative temp ID to avoid
+ *   collision with real DB IDs (which start at 1). On the next project
+ *   reload, the REST fetch returns the real row and replaces the temp one.
+ *   The temp ID is tracked in a ref so it can be cleaned up if needed.
+ *
+ *   The Show Work toggle now also shows model and memory info from
+ *   assistant message metadata_json (rendered by ChatThread/ShowWorkMeta).
  */
 
 import React, { useState, useRef } from 'react'
@@ -106,6 +109,10 @@ function ModelPicker({ localNames, selected, onSelect }: ModelPickerProps) {
 // ChatBar
 // ---------------------------------------------------------------------------
 
+// Use large negative IDs for optimistic messages to avoid collision with
+// real DB IDs (which are always positive integers starting at 1).
+let _optimisticIdCounter = -1
+
 export function ChatBar() {
   const [value, setValue] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -115,6 +122,7 @@ export function ChatBar() {
     activeProjectId,
     showWorkMode,
     toggleShowWork,
+    appendPersistedMessage,
   } = useStore()
 
   const { data: localData } = useQuery({
@@ -135,7 +143,23 @@ export function ChatBar() {
     if (!value.trim() || !activeProjectId || !selectedModel) return
 
     const messageId = `msg-${Date.now()}`
-    // Dispatch over WS — backend persists user + assistant messages to DB.
+    const optimisticId = _optimisticIdCounter--
+
+    // Add optimistic user message to the persisted list immediately
+    // so the user sees their message without waiting for the backend.
+    // Uses a negative temp ID. When the project is reloaded from DB,
+    // the real row replaces it via setPersistedMessages.
+    appendPersistedMessage({
+      id: optimisticId,
+      project_id: activeProjectId,
+      role: 'user',
+      content: value.trim(),
+      created_at: new Date().toISOString(),
+      kind: 'chat',
+      metadata_json: '{}',
+    })
+
+    // Dispatch the chat message over WebSocket
     window.dispatchEvent(
       new CustomEvent('alfred:send', {
         detail: {
@@ -146,18 +170,6 @@ export function ChatBar() {
         },
       })
     )
-
-    // Optimistically add the user message to the persisted list so it
-    // appears immediately without waiting for a DB round-trip.
-    useStore.getState().appendPersistedMessage({
-      id: Date.now(), // temporary id; real id comes on next reload
-      project_id: activeProjectId,
-      role: 'user',
-      content: value.trim(),
-      created_at: new Date().toISOString(),
-      kind: 'chat',
-      metadata_json: '{}',
-    })
 
     setValue('')
     if (textareaRef.current) {
@@ -233,7 +245,6 @@ export function ChatBar() {
             minHeight: '24px',
           }}
         />
-
         <button
           onClick={handleSend}
           disabled={!canSend}
@@ -245,9 +256,8 @@ export function ChatBar() {
         </button>
       </div>
 
-      {/* Bottom toolbar row */}
+      {/* Bottom toolbar */}
       <div className="flex items-center gap-3 mt-2">
-        {/* Model picker */}
         <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
           Model:
         </span>
@@ -263,14 +273,17 @@ export function ChatBar() {
           </span>
         )}
 
-        {/* Spacer */}
         <div className="flex-1" />
 
         {/* Show your work toggle */}
         <button
           onClick={toggleShowWork}
           className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors"
-          title={showWorkMode ? 'Hide thinking tabs' : 'Show your work — expand all thinking tabs'}
+          title={
+            showWorkMode
+              ? 'Hide: raw LLM input, memory tokens, tool calls'
+              : 'Show your work: reveal raw LLM input, memory tokens, tool calls'
+          }
           style={{
             color: showWorkMode ? 'var(--info)' : 'var(--text-tertiary)',
             borderColor: showWorkMode ? 'rgba(167,139,250,0.4)' : 'var(--border)',
@@ -281,12 +294,12 @@ export function ChatBar() {
           Show work
         </button>
 
-        {/* Demo pipeline button — dev/QA convenience */}
+        {/* Demo pipeline — dev/QA convenience */}
         {activeProjectId && (
           <button
             onClick={handleDemoPipeline}
             className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors"
-            title="Trigger demo pipeline to test the state machine UI"
+            title="Trigger the demo pipeline to test the state machine UI"
             style={{
               color: 'var(--text-tertiary)',
               borderColor: 'var(--border)',

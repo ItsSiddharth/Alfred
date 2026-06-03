@@ -1,0 +1,36 @@
+2026-06-02 11:38:03,161 [INFO] alfred.main: ALFRED backend ready. Awaiting first-run setup.
+2026-06-02 11:38:03,167 [INFO] alfred.tools.base: Loaded tool: web_search (enabled=True)
+2026-06-02 11:38:03,167 [ERROR] alfred.tools.base: Failed to load tool arxiv_search: No module named 'alfred.tools.arxiv_search'
+2026-06-02 11:38:03,170 [INFO] alfred.tools.base: Loaded tool: semantic_scholar (enabled=True)
+2026-06-02 11:38:03,171 [ERROR] alfred.tools.base: Failed to load tool openalex_search: No module named 'alfred.tools.openalex_search'
+2026-06-02 11:38:03,171 [INFO] alfred.main: Tools loaded: ['web_search', 'semantic_scholar']
+2026-06-02 11:38:34,503 [INFO] alfred.main: ALFRED backend ready. Awaiting first-run setup.
+2026-06-02 11:38:34,506 [INFO] alfred.tools.base: Loaded tool: web_search (enabled=True)
+2026-06-02 11:38:34,507 [INFO] alfred.tools.base: Loaded tool: arxiv_search (enabled=True)
+2026-06-02 11:38:34,508 [INFO] alfred.tools.base: Loaded tool: semantic_scholar (enabled=True)
+2026-06-02 11:38:34,509 [ERROR] alfred.tools.base: Failed to load tool openalex_search: No module named 'alfred.tools.openalex_search'
+2026-06-02 11:38:34,509 [INFO] alfred.main: Tools loaded: ['web_search', 'arxiv_search', 'semantic_scholar']
+2026-06-02 11:38:55,040 [INFO] alfred.main: ALFRED backend ready. Awaiting first-run setup.
+2026-06-02 11:38:55,043 [INFO] alfred.tools.base: Loaded tool: web_search (enabled=True)
+2026-06-02 11:38:55,044 [INFO] alfred.tools.base: Loaded tool: arxiv_search (enabled=True)
+2026-06-02 11:38:55,045 [INFO] alfred.tools.base: Loaded tool: semantic_scholar (enabled=True)
+2026-06-02 11:38:55,045 [ERROR] alfred.tools.base: Failed to load tool openalex_search: No module named 'alfred.tools.openalex_search'
+2026-06-02 11:38:55,045 [INFO] alfred.main: Tools loaded: ['web_search', 'arxiv_search', 'semantic_scholar']
+2026-06-02 11:40:03,595 [INFO] alfred.main: ALFRED backend ready. Awaiting first-run setup.
+2026-06-02 11:40:03,597 [INFO] alfred.tools.base: Loaded tool: web_search (enabled=True)
+2026-06-02 11:40:03,598 [INFO] alfred.tools.base: Loaded tool: arxiv_search (enabled=True)
+2026-06-02 11:40:03,599 [INFO] alfred.tools.base: Loaded tool: semantic_scholar (enabled=True)
+2026-06-02 11:40:03,600 [ERROR] alfred.tools.base: Failed to load tool openalex_search: module 'alfred.tools.openalex_search' has no attribute 'OpenAlexSearchTool'
+2026-06-02 11:40:03,600 [INFO] alfred.main: Tools loaded: ['web_search', 'arxiv_search', 'semantic_scholar']
+2026-06-02 11:40:07,985 [INFO] alfred.main: ALFRED backend ready. Awaiting first-run setup.
+2026-06-02 11:40:07,988 [INFO] alfred.tools.base: Loaded tool: web_search (enabled=True)
+2026-06-02 11:40:07,989 [INFO] alfred.tools.base: Loaded tool: arxiv_search (enabled=True)
+2026-06-02 11:40:07,990 [INFO] alfred.tools.base: Loaded tool: semantic_scholar (enabled=True)
+2026-06-02 11:40:08,031 [INFO] alfred.tools.base: Loaded tool: openalex_search (enabled=True)
+2026-06-02 11:40:08,032 [INFO] alfred.main: Tools loaded: ['web_search', 'arxiv_search', 'semantic_scholar', 'openalex_search']
+2026-06-02 11:40:17,530 [INFO] alfred.main: ALFRED backend ready. Awaiting first-run setup.
+2026-06-02 11:40:17,532 [INFO] alfred.tools.base: Loaded tool: web_search (enabled=True)
+2026-06-02 11:40:17,533 [INFO] alfred.tools.base: Loaded tool: arxiv_search (enabled=True)
+2026-06-02 11:40:17,534 [INFO] alfred.tools.base: Loaded tool: semantic_scholar (enabled=True)
+2026-06-02 11:40:17,575 [INFO] alfred.tools.base: Loaded tool: openalex_search (enabled=True)
+2026-06-02 11:40:17,575 [INFO] alfred.main: Tools loaded: ['web_search', 'arxiv_search', 'semantic_scholar', 'openalex_search']
