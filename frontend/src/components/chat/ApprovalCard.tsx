@@ -10,10 +10,9 @@
  * Auto-approve: card renders marked "auto-approved" in amber; no buttons shown
  * (machine already proceeded but card is still displayed for transparency).
  *
- * The card content is determined by the plan shape:
- *   - novelty_score / gap_score / publishability_score → Stage 1 scorecard
- *   - dataset / architecture / metrics → Stage 2 experiment plan
- *   - generic key-value → fallback
+ * Stage 1 scorecard: per-score citations, collapsible literature landscape,
+ *   and a "Re-run with deeper search" button on rejection.
+ * Stage 2 plan card: generic key-value with edit support.
  */
 
 import { useState } from 'react'
@@ -26,23 +25,67 @@ import {
   ChevronDown,
   ChevronRight,
   ExternalLink,
+  RefreshCw,
 } from 'lucide-react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { experimentsApi } from '../../api/client'
+import { experimentsApi, hypothesisApi } from '../../api/client'
 import { useStore, type ApprovalRequest } from '../../store'
 import { Button } from '../common/Button'
 
 // ---------------------------------------------------------------------------
-// Score meter — Stage 1 scorecard
+// Citations list — reused inside each ScoreMeter
+// ---------------------------------------------------------------------------
+
+type Citation = { title: string; year?: number; venue?: string; url?: string }
+
+function CitationsList({ citations }: { citations: Citation[] }) {
+  if (!citations || citations.length === 0) return null
+  return (
+    <div className="mt-2 space-y-1">
+      {citations.map((c, i) => (
+        <div key={i} className="flex items-start gap-1.5">
+          <span className="text-xs font-mono shrink-0 mt-0.5" style={{ color: 'var(--text-tertiary)' }}>
+            [{c.year ?? '?'}]
+          </span>
+          <div className="min-w-0">
+            {c.url ? (
+              <a
+                href={c.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs hover:underline flex items-center gap-1"
+                style={{ color: 'var(--accent)' }}
+              >
+                <span className="truncate">{c.title}</span>
+                <ExternalLink size={9} className="shrink-0" />
+              </a>
+            ) : (
+              <span className="text-xs" style={{ color: 'var(--text-primary)' }}>{c.title}</span>
+            )}
+            {c.venue && (
+              <span className="text-xs font-mono ml-1" style={{ color: 'var(--text-tertiary)' }}>
+                · {c.venue}
+              </span>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Score meter — Stage 1 scorecard with per-score citations
 // ---------------------------------------------------------------------------
 
 interface ScoreMeterProps {
   label: string
   value: number
   rationale?: string
+  citations?: Citation[]
 }
 
-function ScoreMeter({ label, value, rationale }: ScoreMeterProps) {
+function ScoreMeter({ label, value, rationale, citations = [] }: ScoreMeterProps) {
   const [expanded, setExpanded] = useState(false)
 
   const color =
@@ -52,14 +95,17 @@ function ScoreMeter({ label, value, rationale }: ScoreMeterProps) {
       ? 'var(--warn)'
       : 'var(--danger)'
 
+  const hasDetail = !!rationale || citations.length > 0
+
   return (
     <div
       className="rounded border overflow-hidden"
       style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}
     >
       <button
-        onClick={() => setExpanded((e) => !e)}
+        onClick={() => hasDetail && setExpanded((e) => !e)}
         className="w-full flex items-center gap-3 px-3 py-2.5 text-left"
+        style={{ cursor: hasDetail ? 'pointer' : 'default' }}
       >
         <span
           className="text-xs font-mono font-medium w-24 shrink-0"
@@ -68,7 +114,6 @@ function ScoreMeter({ label, value, rationale }: ScoreMeterProps) {
           {label}
         </span>
 
-        {/* Bar */}
         <div
           className="flex-1 h-1.5 rounded-full overflow-hidden"
           style={{ backgroundColor: 'var(--bg-elevated)' }}
@@ -86,17 +131,20 @@ function ScoreMeter({ label, value, rationale }: ScoreMeterProps) {
           {value}
         </span>
 
-        <span style={{ color: 'var(--text-tertiary)' }}>
-          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        </span>
+        {hasDetail && (
+          <span style={{ color: 'var(--text-tertiary)' }}>
+            {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          </span>
+        )}
       </button>
 
-      {expanded && rationale && (
+      {expanded && (
         <div
-          className="px-3 pb-2.5 text-xs border-t"
+          className="px-3 pb-3 text-xs border-t"
           style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', lineHeight: '1.6' }}
         >
-          {rationale}
+          {rationale && <p className="mt-2">{rationale}</p>}
+          <CitationsList citations={citations} />
         </div>
       )}
     </div>
@@ -104,7 +152,7 @@ function ScoreMeter({ label, value, rationale }: ScoreMeterProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1 scorecard view
+// Stage 1 scorecard view — with landscape section
 // ---------------------------------------------------------------------------
 
 interface ScorecardViewProps {
@@ -114,93 +162,69 @@ interface ScorecardViewProps {
   onEditChange: (key: string, value: unknown) => void
 }
 
-function ScorecardView({ plan, editMode, editedPlan, onEditChange }: ScorecardViewProps) {
-  const scores = [
-    {
-      label: 'Novelty',
-      key: 'novelty_score',
-      rationale: plan.novelty_rationale as string | undefined,
-    },
-    {
-      label: 'Gap realness',
-      key: 'gap_score',
-      rationale: plan.gap_rationale as string | undefined,
-    },
-    {
-      label: 'Publishability',
-      key: 'publishability_score',
-      rationale: plan.publishability_rationale as string | undefined,
-    },
+function ScorecardView({ plan, editedPlan }: ScorecardViewProps) {
+  const [landscapeExpanded, setLandscapeExpanded] = useState(false)
+
+  const scores: Array<{
+    label: string
+    key: string
+    rationaleKey: string
+    citationsKey: string
+  }> = [
+    { label: 'Novelty', key: 'novelty_score', rationaleKey: 'novelty_rationale', citationsKey: 'novelty_citations' },
+    { label: 'Gap realness', key: 'gap_score', rationaleKey: 'gap_rationale', citationsKey: 'gap_citations' },
+    { label: 'Publishability', key: 'publishability_score', rationaleKey: 'publishability_rationale', citationsKey: 'publishability_citations' },
   ]
 
-  const papers = (plan.cited_papers as Array<{ title: string; year: number; venue: string; url?: string }>) ?? []
+  const landscape = plan.landscape as string | undefined
+  const cited_papers = (plan.cited_papers as Citation[]) ?? []
 
   return (
     <div className="space-y-2">
-      {scores.map(({ label, key, rationale }) => (
-        <ScoreMeter
-          key={key}
-          label={label}
-          value={(editedPlan[key] as number) ?? (plan[key] as number) ?? 0}
-          rationale={rationale ?? (plan.rationale as string | undefined)}
-        />
-      ))}
+      {scores.map(({ label, key, rationaleKey, citationsKey }) => {
+        const perScoreCitations = (plan[citationsKey] as Citation[]) ?? []
+        const fallbackCitations = perScoreCitations.length > 0 ? perScoreCitations : cited_papers
+        return (
+          <ScoreMeter
+            key={key}
+            label={label}
+            value={(editedPlan[key] as number) ?? (plan[key] as number) ?? 0}
+            rationale={(plan[rationaleKey] as string | undefined) ?? (plan.rationale as string | undefined)}
+            citations={fallbackCitations.slice(0, 5)}
+          />
+        )
+      })}
 
-      {plan.rationale && (
-        <div
-          className="px-3 py-2.5 rounded border text-xs"
-          style={{
-            borderColor: 'var(--border)',
-            backgroundColor: 'var(--bg-inset)',
-            color: 'var(--text-secondary)',
-            lineHeight: '1.6',
-          }}
-        >
-          <div className="font-medium font-mono mb-1" style={{ color: 'var(--text-tertiary)' }}>
-            Summary
-          </div>
-          {plan.rationale as string}
-        </div>
-      )}
-
-      {papers.length > 0 && (
+      {/* Literature landscape (collapsible) */}
+      {landscape && (
         <div
           className="rounded border overflow-hidden"
           style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}
         >
-          <div
-            className="px-3 py-2 text-xs font-mono font-medium border-b"
-            style={{ borderColor: 'var(--border)', color: 'var(--text-tertiary)' }}
+          <button
+            onClick={() => setLandscapeExpanded((e) => !e)}
+            className="w-full flex items-center gap-2 px-3 py-2.5 text-left"
           >
-            Key citations
-          </div>
-          <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
-            {papers.map((p, i) => (
-              <div key={i} className="flex items-start gap-2 px-3 py-2">
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs truncate" style={{ color: 'var(--text-primary)' }}>
-                    {p.url ? (
-                      <a
-                        href={p.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="hover:underline flex items-center gap-1"
-                        style={{ color: 'var(--accent)' }}
-                      >
-                        {p.title}
-                        <ExternalLink size={9} />
-                      </a>
-                    ) : (
-                      p.title
-                    )}
-                  </div>
-                  <div className="text-xs font-mono mt-0.5" style={{ color: 'var(--text-tertiary)' }}>
-                    {p.year} · {p.venue}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+            <span className="text-xs font-mono font-medium flex-1" style={{ color: 'var(--text-tertiary)' }}>
+              Literature landscape
+            </span>
+            <span style={{ color: 'var(--text-tertiary)' }}>
+              {landscapeExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+            </span>
+          </button>
+          {landscapeExpanded && (
+            <div
+              className="px-3 pb-3 text-xs border-t"
+              style={{
+                borderColor: 'var(--border)',
+                color: 'var(--text-secondary)',
+                lineHeight: '1.7',
+                whiteSpace: 'pre-wrap',
+              }}
+            >
+              <p className="mt-2">{landscape}</p>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -302,6 +326,7 @@ interface ApprovalCardProps {
 export function ApprovalCard({ request }: ApprovalCardProps) {
   const { plan, auto_approve, stage, substage, experiment_id } = request
   const activeProjectId = useStore((s) => s.activeProjectId)
+  const selectedModel = useStore((s) => s.selectedModel)
   const setApprovalRequest = useStore((s) => s.setApprovalRequest)
   const queryClient = useQueryClient()
 
@@ -347,7 +372,26 @@ export function ApprovalCard({ request }: ApprovalCardProps) {
     },
   })
 
-  const stageLabel = stage === 1 ? 'Hypothesis' : stage === 2 ? 'Setup' : 'Run'
+  // Re-run mutation (Stage 1 scorecard only)
+  const rerunMutation = useMutation({
+    mutationFn: async () => {
+      if (!activeProjectId) throw new Error('No active project')
+      if (!selectedModel) throw new Error('No model selected')
+      // First reject the current gate, then start a new run with feedback
+      const expId = experiment_id ?? 0
+      await experimentsApi.reject(activeProjectId, expId, feedback || 'Re-run requested')
+      // Extract hypothesis from plan (rationale is the landscape text used as proxy)
+      const hypothesis =
+        (plan.hypothesis as string) ||
+        (plan.landscape as string | undefined)?.slice(0, 500) ||
+        'Re-run hypothesis validation'
+      return hypothesisApi.start(activeProjectId, hypothesis, selectedModel, feedback)
+    },
+    onSuccess: () => {
+      setApprovalRequest(null)
+    },
+  })
+
   const substageLabel = substage.replace(/_/g, ' ')
 
   return (
@@ -502,11 +546,25 @@ export function ApprovalCard({ request }: ApprovalCardProps) {
                 size="sm"
                 variant="danger"
                 onClick={() => rejectMutation.mutate()}
-                disabled={rejectMutation.isPending}
+                disabled={rejectMutation.isPending || rerunMutation.isPending}
               >
                 <XCircle size={12} />
                 {rejectMutation.isPending ? 'Sending…' : 'Send feedback'}
               </Button>
+
+              {/* Re-run with deeper search — Stage 1 scorecard only */}
+              {isScorecard && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => rerunMutation.mutate()}
+                  disabled={rerunMutation.isPending || rejectMutation.isPending}
+                >
+                  <RefreshCw size={11} />
+                  {rerunMutation.isPending ? 'Starting…' : 'Re-run research'}
+                </Button>
+              )}
+
               <Button
                 size="sm"
                 variant="ghost"

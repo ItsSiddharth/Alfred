@@ -90,7 +90,12 @@ def add_column_if_missing(
     conn = sqlite3.connect(str(db_path))
     try:
         cursor = conn.execute(f"PRAGMA table_info({table})")
-        existing_columns = {row[1] for row in cursor.fetchall()}
+        rows = cursor.fetchall()
+        if not rows:
+            # Table doesn't exist yet — create_all will create it with the column already included
+            logger.debug("Table '%s' does not exist yet — migration skipped.", table)
+            return
+        existing_columns = {row[1] for row in rows}
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
             conn.commit()

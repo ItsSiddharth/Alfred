@@ -32,7 +32,7 @@
  *   "Approved — pipeline continuing" state to the card.
  */
 
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -46,9 +46,13 @@ import {
   Wrench,
   Brain,
   AlertTriangle,
+  Search,
+  Globe,
+  BookOpen,
+  FileText,
 } from 'lucide-react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useStore, type PersistedMessage, type LogEntry } from '../../store'
+import { useMutation } from '@tanstack/react-query'
+import { useStore, type PersistedMessage, type ToolCallEvent } from '../../store'
 import { experimentsApi } from '../../api/client'
 import type { ApprovalRequest } from '../../store'
 import 'highlight.js/styles/github-dark.css'
@@ -203,7 +207,7 @@ export function ThinkingTab({ content, isStreaming, title = 'Thinking', defaultE
 }
 
 // ---------------------------------------------------------------------------
-// ShowWorkMeta — raw LLM context panel (Fix 2: reads live metadata)
+// ShowWorkMeta — per-message LLM context (model + memory injected)
 // ---------------------------------------------------------------------------
 
 function ShowWorkMeta({ metadataJson }: { metadataJson: string }) {
@@ -219,7 +223,6 @@ function ShowWorkMeta({ metadataJson }: { metadataJson: string }) {
   const model = meta.model as string | undefined
   const memoryBlock = meta.memory_block as string | undefined
 
-  // Nothing interesting to show
   if (!memoryTokens && !model && !memoryBlock) return null
 
   return (
@@ -228,9 +231,9 @@ function ShowWorkMeta({ metadataJson }: { metadataJson: string }) {
         className="flex items-center gap-1.5 text-xs font-mono"
         style={{ color: 'var(--text-tertiary)' }}>
         <Brain size={10} style={{ color: 'var(--info)' }} />
-        {model && <span className="mr-1" style={{ color: 'var(--text-tertiary)' }}>{model}</span>}
+        {model && <span style={{ color: 'var(--text-secondary)' }}>{model}</span>}
         {memoryTokens != null && memoryTokens > 0 && (
-          <span style={{ color: 'var(--info)' }}>~{memoryTokens} memory tokens injected</span>
+          <span style={{ color: 'var(--info)' }}>· {memoryTokens} memory tokens</span>
         )}
         {memoryBlock && (
           <span className="ml-1" style={{ color: 'var(--text-tertiary)' }}>
@@ -242,7 +245,7 @@ function ShowWorkMeta({ metadataJson }: { metadataJson: string }) {
         <div className="mt-1 p-2 rounded text-xs font-mono"
           style={{
             backgroundColor: 'var(--bg-inset)', border: '1px solid var(--border)',
-            color: 'var(--text-tertiary)', maxHeight: '200px', overflowY: 'auto',
+            color: 'var(--text-tertiary)', maxHeight: '160px', overflowY: 'auto',
             whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           }}>
           {memoryBlock}
@@ -253,19 +256,126 @@ function ShowWorkMeta({ metadataJson }: { metadataJson: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// ToolCallEntry
+// ToolCallCard — inline Show Work card for a single tool invocation
 // ---------------------------------------------------------------------------
 
-function ToolCallEntry({ entry }: { entry: LogEntry }) {
-  const showWorkMode = useStore((s) => s.showWorkMode)
-  if (!showWorkMode) return null
+function toolIcon(name: string) {
+  if (name.includes('web') || name.includes('ddg')) return <Globe size={11} />
+  if (name.includes('arxiv')) return <FileText size={11} />
+  if (name.includes('semantic') || name.includes('scholar')) return <BookOpen size={11} />
+  if (name.includes('openalex')) return <Search size={11} />
+  return <Wrench size={11} />
+}
+
+function ToolCallCard({ event }: { event: ToolCallEvent }) {
+  const [expanded, setExpanded] = useState(false)
+  const query = event.input?.query as string | undefined
+  const op = event.input?.op as string | undefined
+  const paperId = event.input?.paper_id as string | undefined
+
+  const statusColor =
+    event.status === 'done' ? 'var(--running)' :
+    event.status === 'error' ? 'var(--danger)' : 'var(--warn)'
+
+  const label = op === 'expand'
+    ? `${event.tool_name} expand · ${paperId?.slice(0, 12) ?? ''}`
+    : query
+    ? `${event.tool_name} · "${query.slice(0, 60)}${query.length > 60 ? '…' : ''}"`
+    : event.tool_name
+
   return (
-    <div className="flex items-start gap-2 px-4 py-1.5 text-xs font-mono" style={{ color: 'var(--text-tertiary)' }}>
-      <Wrench size={11} className="mt-0.5 shrink-0" style={{ color: 'var(--accent)' }} />
-      <span style={{ color: 'var(--text-secondary)' }}>{entry.content}</span>
+    <div className="rounded border overflow-hidden"
+      style={{ backgroundColor: 'var(--bg-inset)', borderColor: 'var(--border)' }}>
+      <button onClick={() => setExpanded(e => !e)}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-left">
+        <span style={{ color: statusColor }}>{toolIcon(event.tool_name)}</span>
+        <span className="flex-1 text-xs font-mono truncate" style={{ color: 'var(--text-secondary)' }}>
+          {label}
+        </span>
+        {event.result_count != null && (
+          <span className="text-xs font-mono shrink-0" style={{ color: 'var(--text-tertiary)' }}>
+            {event.result_count} results
+          </span>
+        )}
+        {event.status === 'running' && (
+          <span className="shrink-0 w-1.5 h-1.5 rounded-full pulse-dot" style={{ backgroundColor: 'var(--warn)' }} />
+        )}
+        {(query || paperId) && (
+          <span style={{ color: 'var(--text-tertiary)' }}>
+            {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <div className="px-3 pb-2 border-t text-xs font-mono space-y-1"
+          style={{ borderColor: 'var(--border)', color: 'var(--text-tertiary)' }}>
+          {query && (
+            <div className="mt-1.5">
+              <span style={{ color: 'var(--text-tertiary)' }}>query: </span>
+              <span style={{ color: 'var(--text-secondary)' }}>{query}</span>
+            </div>
+          )}
+          {event.sources && event.sources.length > 0 && (
+            <div>
+              <span style={{ color: 'var(--text-tertiary)' }}>sources:</span>
+              {event.sources.map((s, i) => (
+                <div key={i} className="ml-2 truncate">
+                  <a href={s} target="_blank" rel="noopener noreferrer"
+                    style={{ color: 'var(--accent)', textDecoration: 'underline' }}>
+                    {s}
+                  </a>
+                </div>
+              ))}
+            </div>
+          )}
+          {event.error && (
+            <div style={{ color: 'var(--danger)' }}>error: {event.error}</div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
+
+// ---------------------------------------------------------------------------
+// ShowWorkFeed — live tool call feed, visible only in Show Work mode
+// ---------------------------------------------------------------------------
+
+function ShowWorkFeed() {
+  const showWorkMode = useStore((s) => s.showWorkMode)
+  const toolCalls = useStore((s) => s.toolCalls)
+  const [expanded, setExpanded] = useState(true)
+
+  if (!showWorkMode || toolCalls.length === 0) return null
+
+  // toolCalls is newest-first; display oldest-first
+  const ordered = [...toolCalls].reverse()
+
+  return (
+    <div className="mx-4 my-2 rounded border overflow-hidden"
+      style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-surface)' }}>
+      <button onClick={() => setExpanded(e => !e)}
+        className="w-full flex items-center gap-2 px-3 py-2 text-left border-b"
+        style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-elevated)' }}>
+        <Wrench size={11} style={{ color: 'var(--accent)' }} />
+        <span className="flex-1 text-xs font-mono font-medium" style={{ color: 'var(--text-secondary)' }}>
+          Research activity · {toolCalls.length} tool call{toolCalls.length !== 1 ? 's' : ''}
+        </span>
+        <span style={{ color: 'var(--text-tertiary)' }}>
+          {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+        </span>
+      </button>
+      {expanded && (
+        <div className="p-2 space-y-1">
+          {ordered.map((evt, i) => (
+            <ToolCallCard key={i} event={evt} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 
 // ---------------------------------------------------------------------------
 // ChatBubble — Fix 1: plain text during streaming, markdown after
@@ -433,10 +543,10 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
   // Scores from plan
   const plan = request.plan
   const hasScores = 'novelty_score' in plan || 'gap_score' in plan
-  const scores = hasScores ? [
-    { label: 'Novelty', value: plan.novelty_score as number },
-    { label: 'Gap', value: plan.gap_score as number },
-    { label: 'Publishability', value: plan.publishability_score as number },
+  const scores: Array<{ label: string; value: number }> = hasScores ? [
+    { label: 'Novelty', value: (plan.novelty_score as number) ?? 0 },
+    { label: 'Gap', value: (plan.gap_score as number) ?? 0 },
+    { label: 'Publishability', value: (plan.publishability_score as number) ?? 0 },
   ] : []
 
   if (approvedState) {
@@ -493,7 +603,7 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
         })}
 
         {/* Rationale */}
-        {plan.rationale && (
+        {(plan.rationale as string | undefined) && (
           <div className="text-xs px-3 py-2 rounded border"
             style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)', color: 'var(--text-secondary)', lineHeight: '1.6' }}>
             {plan.rationale as string}
@@ -702,18 +812,20 @@ export function ChatThread() {
                 </div>
               )
             }
-            if (entry.kind === 'tool_call') {
-              return <ToolCallEntry key={entry.messageId} entry={entry} />
-            }
+            // Log entries (research phase messages)
             return (
-              <div key={entry.messageId} className="px-4 py-1">
-                <div className="text-xs font-mono px-3 py-1.5 rounded border"
-                  style={{ backgroundColor: 'var(--bg-inset)', borderColor: 'var(--border)', color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap' }}>
-                  {entry.content}
+              <div key={entry.messageId} className="px-4 py-0.5">
+                <div className="flex items-start gap-2 text-xs font-mono px-2 py-1"
+                  style={{ color: 'var(--text-tertiary)' }}>
+                  <span className="shrink-0 mt-0.5" style={{ color: 'var(--accent)' }}>›</span>
+                  <span style={{ color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap' }}>{entry.content}</span>
                 </div>
               </div>
             )
           })}
+
+          {/* Show Work: inline tool call feed */}
+          <ShowWorkFeed />
 
           {/* Orphan streams (no DB row yet — fallback only) */}
           {orphanStreamEntries.map((msg) => {

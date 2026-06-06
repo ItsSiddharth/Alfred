@@ -49,7 +49,6 @@ export function useWebSocket(projectId: number | null) {
     appendLogToken,
     finaliseLog,
     appendPersistedMessage,
-    patchPersistedMessage,
     setStreamingMsgId,
     addToolCall,
   } = useStore()
@@ -94,7 +93,7 @@ export function useWebSocket(projectId: number | null) {
               // appendPersistedMessage guards against duplicate IDs.
               appendPersistedMessage({
                 id: msgId,
-                project_id: projectId,
+                project_id: projectId as number,
                 role: 'assistant',
                 content: '',
                 created_at: new Date().toISOString(),
@@ -143,14 +142,12 @@ export function useWebSocket(projectId: number | null) {
               break
             }
 
-            // Regular assistant tokens: patch the persisted DB-row placeholder
-            // if we have a streamingMsgId, otherwise fall back to buffer.
+            // Regular assistant tokens: append to the persisted DB-row placeholder.
+            // Single setState call — avoids the previous double-update bug where
+            // patchPersistedMessage(id, '') reset content to '' then setState
+            // appended only the new token, making each token replace the last.
             const streamId = useStore.getState().streamingMsgId
             if (streamId != null) {
-              // F1 fix: only patch persistedMessages, don't also add to
-              // streamingMessages — that causes the double-render.
-              patchPersistedMessage(streamId, '')  // triggers re-render
-              // We need to append, not replace — so read current content first.
               useStore.setState((state) => ({
                 persistedMessages: state.persistedMessages.map((m) =>
                   m.id === streamId ? { ...m, content: m.content + token } : m
@@ -158,7 +155,6 @@ export function useWebSocket(projectId: number | null) {
               }))
             } else {
               // Fallback: no DB row yet (msg_start hasn't arrived or no row)
-              // Use the legacy streaming buffer keyed by message_id string.
               const messageId =
                 (payload.message_id as string) || `stream-${projectId}`
               appendToken(messageId, token)

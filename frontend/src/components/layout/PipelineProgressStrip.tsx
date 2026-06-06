@@ -2,7 +2,6 @@
  * PipelineProgressStrip — always-visible stage/substage/progress bar.
  * Driven entirely by Zustand progress state, fed by WS events.
  */
-import React from "react";
 import { useStore } from "../../store";
 
 const STATUS_COLORS: Record<string, string> = {

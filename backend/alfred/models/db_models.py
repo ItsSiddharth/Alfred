@@ -196,4 +196,5 @@ class Score(SQLModel, table=True):
     kind: ScoreKind
     value: int  # 0–100
     rationale: str = Field(default="")
+    citations_json: str = Field(default="[]")  # JSON array of {title,year,venue,url}
     created_at: datetime = Field(default_factory=datetime.utcnow)

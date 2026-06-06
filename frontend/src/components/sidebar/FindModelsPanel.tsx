@@ -16,7 +16,6 @@ import {
 } from '@tanstack/react-query'
 import {
   Cpu,
-  MemoryStick,
   Download,
   Trash2,
   CheckCircle2,

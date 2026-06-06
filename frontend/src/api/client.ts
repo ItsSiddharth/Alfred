@@ -259,6 +259,38 @@ export interface LocalModelsResponse {
   models: LocalModel[]
 }
 
+// ---------------------------------------------------------------------------
+// Hypothesis API (Stage 5)
+// ---------------------------------------------------------------------------
+
+export interface HypothesisScore {
+  id: number
+  project_id: number
+  kind: 'novelty' | 'gap' | 'publishability'
+  value: number
+  rationale: string
+  citations: Array<{ title: string; year?: number; venue?: string; url?: string }>
+  created_at: string
+}
+
+export const hypothesisApi = {
+  getScores: (projectId: number) =>
+    apiFetch<HypothesisScore[]>(`/api/projects/${projectId}/hypothesis/scores`),
+
+  start: (projectId: number, hypothesis: string, model: string, feedback = '') =>
+    apiFetch<{ status: string; project_id: number }>(
+      `/api/projects/${projectId}/hypothesis/start`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ hypothesis, model, feedback }),
+      }
+    ),
+}
+
+// ---------------------------------------------------------------------------
+// Models API
+// ---------------------------------------------------------------------------
+
 export const modelsApi = {
   getHardware: () => apiFetch<HardwareInfo>('/api/models/hardware'),
   getHealth: () => apiFetch<OllamaHealth>('/api/models/health'),

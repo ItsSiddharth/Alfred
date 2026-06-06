@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from 'react'
 import { Wrench, RefreshCw, ChevronDown, ChevronRight, Play, ToggleLeft, ToggleRight, Loader2 } from 'lucide-react'
-import { useStore, type ToolCallEvent } from '../../store'
+import { useStore } from '../../store'
 
 // ---------------------------------------------------------------------------
 // API helpers (inline — no separate client file needed)
