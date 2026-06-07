@@ -136,6 +136,7 @@ async def pull_model(
                             current=completed,
                             total=total if total else 0,
                             status="running",
+                            model=model_name,
                         )
 
                     if event.get("status") == "success":
@@ -149,6 +150,7 @@ async def pull_model(
                                 current=1,
                                 total=1,
                                 status="done",
+                                model=model_name,
                             )
                         return
 
@@ -339,6 +341,43 @@ async def stream_generate(
 # ---------------------------------------------------------------------------
 # Exception
 # ---------------------------------------------------------------------------
+
+
+async def stream_tokens_iter(
+    model: str,
+    messages: list[dict],
+    options: dict | None = None,
+) -> AsyncIterator[str]:
+    """
+    Async generator that yields raw tokens from Ollama chat without broadcasting.
+    Used by LLMClient.chat_log_stream to surface internal LLM reasoning in the
+    Show Work log panel.
+    """
+    import json as _json
+
+    payload: dict = {"model": model, "messages": messages, "stream": True}
+    if options:
+        payload["options"] = options
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            async with client.stream(
+                "POST", f"{OLLAMA_BASE}/api/chat", json=payload
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = _json.loads(line)
+                    except Exception:
+                        continue
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+                    if chunk.get("done"):
+                        break
+    except Exception as exc:
+        raise OllamaError(f"Token stream failed: {exc}") from exc
 
 
 class OllamaError(Exception):

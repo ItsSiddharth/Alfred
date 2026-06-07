@@ -396,12 +396,35 @@ class ExperimentStateMachine:
         self._db.add(project)
         self._db.commit()
 
+        # Update internal state directly — do NOT call self.transition() here.
+        # transition() would emit state_change/progress WS events that make the
+        # frontend show "writing code" (S3Sub.WRITING_CODE) immediately after plan
+        # approval, confusing the user into thinking something is already running.
         first_sub_map: dict[Stage, AnySubstage] = {
             Stage.HYPOTHESIS: S1Sub.GENERATING_QUERIES,
             Stage.SETUP:      S2Sub.PROPOSING,
-            Stage.RUN:        S3Sub.WRITING_CODE,
+            Stage.RUN:        S3Sub.AWAITING_NEXT,  # idle — user must ask to run
         }
-        await self.transition(first_sub_map[new_stage], stage=new_stage)
+        self._stage = new_stage
+        self._substage = first_sub_map[new_stage]
+        self._persist()
+
+        # Signal frontend: project stage changed → sidebar should reload binding panel
+        await self._ws.send(
+            self._project_id_str,
+            "stage_advance",
+            {"new_stage": stage_map[new_stage].value},
+        )
+        # Reset progress strip to idle
+        await self._ws.broadcast_progress(
+            self._project_id_str,
+            stage=new_stage.value,
+            substage="idle",
+            label="Ready",
+            current=0,
+            total=0,
+            status="idle",
+        )
 
     # ── Auto-approve toggle ────────────────────────────────────────────
 

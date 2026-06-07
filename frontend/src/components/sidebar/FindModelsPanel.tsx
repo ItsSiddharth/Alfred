@@ -8,7 +8,7 @@
  *  4. Recommended catalog — ranked by VRAM fit with pull buttons
  */
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   useQuery,
   useMutation,
@@ -27,6 +27,7 @@ import {
   Zap,
   HardDrive,
   X,
+  Plus,
 } from 'lucide-react'
 import { modelsApi, type CatalogModel, type LocalModel, type VramFit } from '../../api/client'
 import { useStore } from '../../store'
@@ -294,11 +295,12 @@ interface CatalogCardProps {
   model: CatalogModel
   isInstalled: boolean
   isPulling: boolean
+  pullPct: number | null
   onPull: () => void
   onSelect: () => void
 }
 
-function CatalogCard({ model, isInstalled, isPulling, onPull, onSelect }: CatalogCardProps) {
+function CatalogCard({ model, isInstalled, isPulling, pullPct, onPull, onSelect }: CatalogCardProps) {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -375,7 +377,7 @@ function CatalogCard({ model, isInstalled, isPulling, onPull, onSelect }: Catalo
             {isPulling ? (
               <>
                 <Loader2 size={10} className="animate-spin" />
-                Pulling…
+                {pullPct != null && pullPct > 0 ? `${pullPct}%` : 'Pulling…'}
               </>
             ) : (
               <>
@@ -386,6 +388,32 @@ function CatalogCard({ model, isInstalled, isPulling, onPull, onSelect }: Catalo
           </button>
         )}
       </div>
+
+      {/* Download progress bar — determinate when bytes known, indeterminate otherwise */}
+      {isPulling && (
+        <div className="px-2.5 pb-2">
+          <div className="h-1 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-elevated)' }}>
+            {pullPct != null && pullPct > 0 ? (
+              <div
+                className="h-full rounded-full transition-all duration-300"
+                style={{ width: `${pullPct}%`, backgroundColor: 'var(--running)' }}
+              />
+            ) : (
+              <div
+                className="h-full rounded-full"
+                style={{
+                  width: '40%',
+                  backgroundColor: 'var(--running)',
+                  animation: 'indeterminate-slide 1.4s ease-in-out infinite',
+                }}
+              />
+            )}
+          </div>
+          <div className="mt-0.5 text-xs font-mono" style={{ color: 'var(--text-tertiary)' }}>
+            {pullPct != null && pullPct > 0 ? `${pullPct}% downloaded` : 'Downloading…'}
+          </div>
+        </div>
+      )}
 
       {/* Expanded details */}
       {expanded && (
@@ -449,8 +477,14 @@ function CatalogCard({ model, isInstalled, isPulling, onPull, onSelect }: Catalo
 
 export function FindModelsPanel() {
   const qc = useQueryClient()
-  const { selectedModel, setSelectedModel, pullingModels, addPullingModel, removePullingModel, setSidebarPanel } =
-    useStore()
+  const {
+    selectedModel, setSelectedModel,
+    pullingModels, addPullingModel, removePullingModel,
+    pullProgress, setSidebarPanel, activeProjectId,
+  } = useStore()
+
+  // Custom model tag input
+  const [customTag, setCustomTag] = useState('')
 
   // Ollama health (poll every 5s so status reflects changes quickly)
   const { data: health } = useQuery({
@@ -459,11 +493,12 @@ export function FindModelsPanel() {
     refetchInterval: 5000,
   })
 
-  // Local (installed) models
+  // Local (installed) models — poll faster while a pull is in progress
+  const isAnyPulling = pullingModels.size > 0
   const { data: localData, isLoading: localLoading } = useQuery({
     queryKey: ['local-models'],
     queryFn: modelsApi.getLocal,
-    refetchInterval: 8000,
+    refetchInterval: isAnyPulling ? 2000 : 8000,
   })
 
   // Recommended catalog
@@ -477,15 +512,34 @@ export function FindModelsPanel() {
   const localNames = new Set(localModels.map((m) => m.name))
   const catalogModels = recData?.models ?? []
 
-  // Pull mutation
+  // Polling-based pull completion: when a pulling model appears in the local list,
+  // mark it done — this works regardless of WS routing.
+  useEffect(() => {
+    if (!isAnyPulling || localModels.length === 0) return
+    const names = new Set(localModels.map((m) => m.name))
+    for (const tag of Array.from(pullingModels)) {
+      if (names.has(tag)) {
+        removePullingModel(tag)
+        qc.invalidateQueries({ queryKey: ['ollama-health'] })
+      }
+    }
+  }, [localModels, isAnyPulling]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pull mutation — use active project ID so WS progress events reach the frontend.
+  // IMPORTANT: onSettled is NOT used for removePullingModel — the HTTP endpoint returns
+  // 200 immediately (pull runs as a background task), so onSettled fires before any
+  // WS progress arrives. Cleanup happens via the WS 'result' event (model_pulled).
+  const projectIdStr = activeProjectId != null ? String(activeProjectId) : 'global'
   const pullMutation = useMutation({
-    mutationFn: (tag: string) => modelsApi.pull(tag, 'global'),
+    mutationFn: (tag: string) => modelsApi.pull(tag, projectIdStr),
     onMutate: (tag) => addPullingModel(tag),
-    onSettled: (_data, _err, tag) => {
+    onError: (_err, tag) => {
+      // HTTP-level failure (4xx/5xx) — the pull never started, clean up immediately
       removePullingModel(tag)
       qc.invalidateQueries({ queryKey: ['local-models'] })
-      qc.invalidateQueries({ queryKey: ['ollama-health'] })
     },
+    // onSuccess: intentionally omitted — WS 'result' event handles removePullingModel
+    //            when the download actually finishes
   })
 
   // Delete mutation
@@ -503,6 +557,27 @@ export function FindModelsPanel() {
   const handleDelete = (name: string) => {
     setDeletingModel(name)
     deleteMutation.mutate(name, { onSettled: () => setDeletingModel(null) })
+  }
+
+  // Derive customPulling from store (same logic as catalog cards)
+  const customTag_trimmed = customTag.trim()
+  const customPulling = pullingModels.has(customTag_trimmed)
+
+  const handleCustomPull = () => {
+    const tag = customTag_trimmed
+    if (!tag || customPulling) return
+    addPullingModel(tag)
+    modelsApi.pull(tag, projectIdStr).catch(() => {
+      // HTTP error — pull didn't start, clean up
+      removePullingModel(tag)
+    })
+  }
+
+  // Compute pull percentage for currently downloading model
+  const getPullPct = (tag: string): number | null => {
+    if (!pullProgress || pullProgress.model !== tag) return null
+    if (!pullProgress.total || pullProgress.total === 0) return null
+    return Math.round((pullProgress.completed / pullProgress.total) * 100)
   }
 
   return (
@@ -532,9 +607,7 @@ export function FindModelsPanel() {
 
         {/* Installed models */}
         <div className="px-3 mb-1">
-          <div
-            className="flex items-center gap-2 mb-1.5"
-          >
+          <div className="flex items-center gap-2 mb-1.5">
             <HardDrive size={12} style={{ color: 'var(--text-tertiary)' }} />
             <span className="text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
               Installed
@@ -574,6 +647,77 @@ export function FindModelsPanel() {
           ))}
         </div>
 
+        {/* Custom model tag input */}
+        <div className="px-3 mb-4">
+          <div className="flex items-center gap-2 mb-1.5">
+            <Plus size={12} style={{ color: 'var(--text-tertiary)' }} />
+            <span className="text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+              Custom model
+            </span>
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={customTag}
+              onChange={(e) => setCustomTag(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleCustomPull()}
+              placeholder="e.g. qwen2.5-coder:7b"
+              className="flex-1 text-xs font-mono px-2 py-1.5 rounded border outline-none"
+              style={{
+                backgroundColor: 'var(--bg-inset)',
+                borderColor: 'var(--border)',
+                color: 'var(--text-primary)',
+              }}
+              disabled={customPulling}
+            />
+            <button
+              onClick={handleCustomPull}
+              disabled={!customTag.trim() || customPulling}
+              className="shrink-0 flex items-center gap-1 px-2 py-1.5 rounded text-xs font-mono transition-colors disabled:opacity-40"
+              style={{
+                backgroundColor: 'var(--bg-elevated)',
+                color: customPulling ? 'var(--running)' : 'var(--text-secondary)',
+                border: '1px solid var(--border)',
+              }}
+            >
+              {customPulling ? (
+                <><Loader2 size={10} className="animate-spin" />Pulling…</>
+              ) : (
+                <><Download size={10} />Pull</>
+              )}
+            </button>
+          </div>
+          {customPulling && (
+            <div className="mt-1.5">
+              <div className="h-1 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-elevated)' }}>
+                {pullProgress && pullProgress.total > 0 ? (
+                  <div
+                    className="h-full rounded-full transition-all duration-300"
+                    style={{
+                      width: `${Math.round((pullProgress.completed / pullProgress.total) * 100)}%`,
+                      backgroundColor: 'var(--running)',
+                    }}
+                  />
+                ) : (
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: '40%',
+                      backgroundColor: 'var(--running)',
+                      animation: 'indeterminate-slide 1.4s ease-in-out infinite',
+                    }}
+                  />
+                )}
+              </div>
+              <div className="mt-0.5 text-xs font-mono" style={{ color: 'var(--text-tertiary)' }}>
+                {pullProgress && pullProgress.total > 0
+                  ? `${Math.round((pullProgress.completed / pullProgress.total) * 100)}% downloaded`
+                  : 'Downloading…'}
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Catalog */}
         <div className="px-3 mb-1.5">
           <div className="flex items-center gap-2">
@@ -599,6 +743,7 @@ export function FindModelsPanel() {
             model={m}
             isInstalled={localNames.has(m.ollama_tag)}
             isPulling={pullingModels.has(m.ollama_tag)}
+            pullPct={getPullPct(m.ollama_tag)}
             onPull={() => pullMutation.mutate(m.ollama_tag)}
             onSelect={() => setSelectedModel(m.ollama_tag)}
           />

@@ -91,6 +91,12 @@ code, pre, kbd, samp,
   to   { background-position: 28px 0; }
 }
 
+/* ── Indeterminate progress bar (model pull, unknown total) ───────────────── */
+@keyframes indeterminate-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
 /* ── Smooth token streaming ──────────────────────────────────────────────── */
 .token-stream {
   white-space: pre-wrap;

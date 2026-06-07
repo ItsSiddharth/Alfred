@@ -25,11 +25,30 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, AsyncIterator
 
-from alfred.services.ollama import OllamaError, stream_chat
+from alfred.services.ollama import OllamaError, stream_chat, stream_tokens_iter
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Load custom prompts from prompts.toml (repo root), if present
+# ---------------------------------------------------------------------------
+
+import tomllib as _tomllib
+
+_PROMPTS_FILE = Path(__file__).resolve().parent.parent.parent.parent / "prompts.toml"
+_custom_role_prompts: dict[str, str] = {}
+
+try:
+    if _PROMPTS_FILE.exists():
+        with open(_PROMPTS_FILE, "rb") as _f:
+            _data = _tomllib.load(_f)
+        _custom_role_prompts = _data.get("roles", {}) or {}
+        logger.info("Loaded custom prompts from %s (roles: %s)", _PROMPTS_FILE, list(_custom_role_prompts))
+except Exception as _exc:
+    logger.warning("Could not load prompts.toml: %s — using built-in defaults", _exc)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +156,11 @@ Your responsibilities:
 Output format: structured Markdown only, no preamble.
 """,
 }
+
+# Apply overrides from prompts.yaml — role value replaces the built-in prompt entirely.
+for _role in Role:
+    if _role.value in _custom_role_prompts:
+        _SYSTEM_PROMPTS[_role] = _custom_role_prompts[_role.value].rstrip("\n") + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +302,52 @@ class LLMClient:
             ws_manager=None,
             options=self.options or None,
         )
+
+    async def chat_log_stream(
+        self,
+        role: Role,
+        messages: list[dict[str, str]],
+        *,
+        log_phase: str = "fix",
+        log_msg_id: str = "",
+        extra_system: str = "",
+    ) -> str:
+        """
+        Stream tokens as WS 'log' events with a fixed message_id.
+
+        Tokens accumulate into a single logEntry in the frontend store (since
+        they share the same message_id), making the LLM's complete response
+        visible in the Show Work panel without creating a chat bubble.
+
+        Silently falls back to chat_silent() if ws_manager is not set.
+        Returns the full response text.
+        """
+        system_content = _SYSTEM_PROMPTS[role]
+        if extra_system:
+            system_content = system_content.rstrip() + "\n\n" + extra_system.strip()
+
+        full_messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_content},
+            *messages,
+        ]
+
+        if not self.ws_manager or not self.project_id:
+            # No WS connection — collect silently
+            return await stream_chat(
+                self.model, full_messages,
+                project_id="", message_id="", ws_manager=None,
+                options=self.options or None,
+            )
+
+        mid = log_msg_id or f"log-stream-{role.value}"
+        full_text = ""
+        async for token in stream_tokens_iter(self.model, full_messages, self.options or None):
+            full_text += token
+            await self.ws_manager.send(
+                self.project_id, "log",
+                {"message": token, "phase": log_phase, "kind": "log", "message_id": mid},
+            )
+        return full_text
 
     def with_model(self, model: str) -> "LLMClient":
         """Return a new client with a different model (immutable-style)."""

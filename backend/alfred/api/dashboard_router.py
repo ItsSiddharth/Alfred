@@ -103,21 +103,24 @@ async def get_dashboard(
         .order_by(Experiment.iteration.asc())  # type: ignore[arg-type]
     ).all()
 
-    exp_ids = [e.id for e in exps if e.id is not None]
+    # For the table we show all experiments; for charts only use completed ones
+    done_exp_ids = {e.id for e in exps if e.status == ExperimentStatus.done and e.id is not None}
     all_metrics: list[Metric] = []
-    if exp_ids:
+    if done_exp_ids:
         all_metrics = session.exec(
             select(Metric)
-            .where(Metric.experiment_id.in_(exp_ids))  # type: ignore[union-attr]
+            .where(Metric.experiment_id.in_(list(done_exp_ids)))  # type: ignore[union-attr]
             .order_by(Metric.experiment_id.asc(), Metric.name.asc(), Metric.step.asc())  # type: ignore[arg-type]
         ).all()
 
-    # Group by (exp_id, metric_name)
-    curves_map: dict[tuple[int, str], list[MetricPoint]] = defaultdict(list)
+    # Group by (exp_id, metric_name) — deduplicate by keeping last value per step
+    raw_map: dict[tuple[int, str, int], float] = {}
     for m in all_metrics:
-        curves_map[(m.experiment_id, m.name)].append(
-            MetricPoint(step=m.step, value=m.value)
-        )
+        raw_map[(m.experiment_id, m.name, m.step)] = m.value
+
+    curves_map: dict[tuple[int, str], list[MetricPoint]] = defaultdict(list)
+    for (exp_id, name, step), value in sorted(raw_map.items()):
+        curves_map[(exp_id, name)].append(MetricPoint(step=step, value=value))
 
     metric_names_set: set[str] = set()
     metric_curves: list[MetricCurve] = []
@@ -138,9 +141,10 @@ async def get_dashboard(
     exp_rows: list[ExperimentRow] = []
     for exp in exps:
         metrics_summary: dict[str, float] = {}
-        for (eid, mname), pts in curves_map.items():
-            if eid == exp.id and pts:
-                metrics_summary[mname] = pts[-1].value
+        if exp.id in done_exp_ids:
+            for (eid, mname), pts in curves_map.items():
+                if eid == exp.id and pts:
+                    metrics_summary[mname] = pts[-1].value
 
         plan_summary = ""
         try:

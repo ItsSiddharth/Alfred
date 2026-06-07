@@ -54,8 +54,9 @@ import {
   Pencil,
   FlaskConical,
   Activity,
+  Play,
 } from 'lucide-react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useStore, type PersistedMessage, type ToolCallEvent } from '../../store'
 import { experimentsApi, projectsApi } from '../../api/client'
 import type { ApprovalRequest } from '../../store'
@@ -76,18 +77,20 @@ function MarkdownContent({ content }: { content: string }) {
           const isBlock = className?.startsWith('language-')
           if (isBlock) {
             return (
-              <pre
-                className="rounded overflow-x-auto my-2"
+              <div
+                className="rounded my-2 overflow-x-auto"
                 style={{ backgroundColor: 'var(--bg-inset)', padding: '12px' }}
               >
-                <code
-                  className={className}
-                  style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '12px' }}
-                  {...props}
-                >
-                  {children}
-                </code>
-              </pre>
+                <pre style={{ margin: 0, minWidth: 'max-content' }}>
+                  <code
+                    className={className}
+                    style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '12px', whiteSpace: 'pre' }}
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                </pre>
+              </div>
             )
           }
           return (
@@ -390,13 +393,14 @@ function WorkingIndicator() {
   const progress = useStore((s) => s.progress)
   const streamingMsgId = useStore((s) => s.streamingMsgId)
   const logEntries = useStore((s) => s.logEntries)
+  const approvalRequest = useStore((s) => s.approvalRequest)
 
   const isActive = progress.status === 'running' || progress.status === 'waiting'
   const isStreaming = streamingMsgId !== null
   const hasActiveLogs = Object.values(logEntries).some((e) => e.isStreaming)
 
-  // Only show when the backend is working but nothing is visibly streaming
-  if (!isActive || isStreaming || hasActiveLogs) return null
+  // Hide when approval card is already showing — it provides its own visual state
+  if (!isActive || isStreaming || hasActiveLogs || approvalRequest !== null) return null
 
   const label = progress.label || progress.substage || 'Working…'
 
@@ -435,32 +439,38 @@ function WorkingIndicator() {
 
 function ResearchLogFeed() {
   const logEntries = useStore((s) => s.logEntries)
+  const showWorkMode = useStore((s) => s.showWorkMode)
   const [expanded, setExpanded] = useState(true)
   const bodyRef = useRef<HTMLDivElement>(null)
 
   const logValues = Object.values(logEntries).filter((e) => e.kind === 'log')
   const isAnyStreaming = logValues.some((e) => e.isStreaming)
 
-  // Auto-collapse 2s after streaming stops
+  // Auto-collapse 2s after streaming stops (only when Show Work console is NOT open,
+  // since in Show Work mode the console at the bottom handles display)
   useEffect(() => {
+    if (showWorkMode) {
+      setExpanded(false)
+      return
+    }
     if (!isAnyStreaming && logValues.length > 0) {
       const t = setTimeout(() => setExpanded(false), 2000)
       return () => clearTimeout(t)
     }
-  }, [isAnyStreaming]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isAnyStreaming, showWorkMode]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Re-expand when streaming resumes
   useEffect(() => {
-    if (isAnyStreaming) setExpanded(true)
-  }, [isAnyStreaming])
+    if (isAnyStreaming && !showWorkMode) setExpanded(true)
+  }, [isAnyStreaming, showWorkMode])
 
-  // Auto-scroll body on new lines
   useEffect(() => {
     if (expanded && bodyRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight
     }
-  }, [logValues.length, expanded])
+  }) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // When Show Work console is active, hide this inline feed (console is more informative)
+  if (showWorkMode) return null
   if (logValues.length === 0) return null
 
   return (
@@ -471,7 +481,7 @@ function ResearchLogFeed() {
         style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-elevated)' }}>
         <Activity size={11} style={{ color: isAnyStreaming ? 'var(--info)' : 'var(--text-tertiary)' }} />
         <span className="flex-1 text-xs font-mono" style={{ color: 'var(--text-secondary)' }}>
-          Research logs · {logValues.length} entr{logValues.length !== 1 ? 'ies' : 'y'}
+          Run logs · {logValues.length} entr{logValues.length !== 1 ? 'ies' : 'y'}
           {isAnyStreaming && <span className="ml-1" style={{ color: 'var(--info)' }}>— live</span>}
         </span>
         <span style={{ color: 'var(--text-tertiary)' }}>
@@ -483,8 +493,18 @@ function ResearchLogFeed() {
           {logValues.map((entry) => (
             <div key={entry.messageId} className="flex items-start gap-2 text-xs font-mono py-0.5">
               <span className="shrink-0 mt-0.5" style={{ color: 'var(--accent)' }}>›</span>
-              <span style={{ color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+              <span style={{
+                color: 'var(--text-tertiary)',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                flex: 1,
+                lineHeight: '1.5',
+              }}>
                 {entry.content}
+                {entry.isStreaming && (
+                  <span className="inline-block w-1 h-3 ml-0.5 rounded-sm pulse-dot align-middle"
+                    style={{ backgroundColor: 'var(--accent)' }} />
+                )}
               </span>
             </div>
           ))}
@@ -534,10 +554,10 @@ function ChatBubble({ role, content, isStreaming = false, metadataJson = '{}' }:
             backgroundColor: isUser ? 'var(--bg-elevated)' : 'var(--bg-surface)',
             border: `1px solid ${isUser ? 'var(--border-strong)' : 'var(--border)'}`,
             color: 'var(--text-primary)',
-            // Assistant bubbles: fill available width up to 72% so streaming
-            // text expands naturally. User bubbles: shrink to content (right-aligned).
             width: isUser ? 'auto' : '100%',
             maxWidth: '72%',
+            minWidth: 0,          // allow flex shrink below content intrinsic width
+            overflow: 'hidden',   // clip overflow so bubble never expands past maxWidth
           }}>
           {isUser ? (
             <span className="token-stream" style={{ whiteSpace: 'pre-wrap' }}>
@@ -610,25 +630,71 @@ function ErrorBubble({ content }: { content: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// NextIterCard — plan body for kind === "next_iteration"
+// NextIterCard — plan body for kind === "next_iteration", with inline editing
 // ---------------------------------------------------------------------------
+
+export interface NextIterEdits {
+  objective?: string
+  architecture?: string
+  rationale?: string
+  changes?: string[]
+  hyperparams?: Record<string, unknown>
+  version_mode?: 'modify' | 'branch'
+}
 
 function NextIterCard({
   plan,
   versionMode,
   onVersionModeChange,
+  edits,
+  onEditsChange,
 }: {
   plan: Record<string, unknown>
   versionMode: 'modify' | 'branch'
   onVersionModeChange: (vm: 'modify' | 'branch') => void
+  edits: NextIterEdits
+  onEditsChange: (e: NextIterEdits) => void
 }) {
-  const changes = plan.changes as string[] | undefined
-  const rationale = plan.rationale as string | undefined
+  const [editMode, setEditMode] = useState(false)
   const iteration = plan.iteration as number | undefined
+
+  const changes = (edits.changes ?? plan.changes) as string[] | undefined
+  const objective = edits.objective ?? (plan.objective as string | undefined) ?? ''
+  const architecture = edits.architecture ?? (plan.architecture as string | undefined) ?? ''
+  const rationale = edits.rationale ?? (plan.rationale as string | undefined) ?? ''
+  const hyperparams = edits.hyperparams ?? (plan.hyperparams as Record<string, unknown> | undefined) ?? {}
+
+  // Local edit buffers (strings, validated on commit)
+  const [localChanges, setLocalChanges] = useState(changes?.join('\n') ?? '')
+  const [localHyperparams, setLocalHyperparams] = useState(
+    JSON.stringify(hyperparams, null, 2)
+  )
+  const [hypError, setHypError] = useState<string | null>(null)
+
+  const commitEdits = () => {
+    const newChanges = localChanges
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+    let parsedHyp: Record<string, unknown> = hyperparams
+    try {
+      parsedHyp = JSON.parse(localHyperparams)
+      setHypError(null)
+    } catch {
+      setHypError('Invalid JSON — hyperparams not saved')
+      return
+    }
+    onEditsChange({
+      ...edits,
+      changes: newChanges,
+      hyperparams: parsedHyp,
+    })
+    setEditMode(false)
+  }
 
   return (
     <div className="space-y-2">
-      {/* Iteration badge + subtitle */}
+      {/* Iteration badge + edit toggle */}
       <div className="flex items-center gap-2">
         <span
           className="text-xs font-mono px-1.5 py-0.5 rounded"
@@ -636,40 +702,186 @@ function NextIterCard({
         >
           iter {iteration}
         </span>
-        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-          Proposed changes from previous run
+        <span className="text-xs flex-1" style={{ color: 'var(--text-tertiary)' }}>
+          ALFRED's proposal — review and edit before approving
         </span>
-      </div>
-
-      {/* Changes list */}
-      {changes && changes.length > 0 && (
-        <div
-          className="px-3 py-2 rounded border text-xs space-y-1"
-          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}
-        >
-          {changes.map((c, i) => (
-            <div key={i} className="flex gap-1.5">
-              <span style={{ color: 'var(--running)' }}>+</span>
-              <span style={{ color: 'var(--text-secondary)' }}>{c}</span>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Rationale */}
-      {rationale && (
-        <div
-          className="text-xs px-3 py-2 rounded border italic"
+        <button
+          onClick={() => {
+            if (editMode) { commitEdits() } else { setEditMode(true) }
+          }}
+          className="flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono border transition-colors"
           style={{
-            borderColor: 'var(--border)',
-            backgroundColor: 'var(--bg-inset)',
-            color: 'var(--text-tertiary)',
-            lineHeight: '1.6',
+            borderColor: editMode ? 'var(--accent)' : 'var(--border)',
+            color: editMode ? 'var(--accent)' : 'var(--text-tertiary)',
+            backgroundColor: 'transparent',
           }}
         >
-          {rationale}
+          <Pencil size={9} />
+          {editMode ? 'Done' : 'Edit'}
+        </button>
+      </div>
+
+      {/* Objective */}
+      <div>
+        <div className="text-xs font-mono mb-0.5" style={{ color: 'var(--text-tertiary)' }}>
+          objective
+        </div>
+        {editMode ? (
+          <textarea
+            rows={2}
+            value={objective}
+            onChange={(e) => onEditsChange({ ...edits, objective: e.target.value })}
+            className="w-full px-2.5 py-1.5 rounded text-xs font-mono resize-none outline-none"
+            style={{
+              backgroundColor: 'var(--bg-inset)',
+              border: '1px solid var(--border-strong)',
+              color: 'var(--text-primary)',
+            }}
+          />
+        ) : (
+          <div
+            className="px-3 py-2 rounded border text-xs"
+            style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)', color: 'var(--text-secondary)' }}
+          >
+            {objective || '—'}
+          </div>
+        )}
+      </div>
+
+      {/* Architecture */}
+      {(architecture || editMode) && (
+        <div>
+          <div className="text-xs font-mono mb-0.5" style={{ color: 'var(--text-tertiary)' }}>
+            architecture
+          </div>
+          {editMode ? (
+            <textarea
+              rows={2}
+              value={architecture}
+              onChange={(e) => onEditsChange({ ...edits, architecture: e.target.value })}
+              className="w-full px-2.5 py-1.5 rounded text-xs font-mono resize-none outline-none"
+              style={{
+                backgroundColor: 'var(--bg-inset)',
+                border: '1px solid var(--border-strong)',
+                color: 'var(--text-primary)',
+              }}
+            />
+          ) : (
+            <div
+              className="px-3 py-2 rounded border text-xs"
+              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)', color: 'var(--text-secondary)' }}
+            >
+              {architecture}
+            </div>
+          )}
         </div>
       )}
+
+      {/* Changes list */}
+      <div>
+        <div className="text-xs font-mono mb-0.5" style={{ color: 'var(--text-tertiary)' }}>
+          changes from previous run
+        </div>
+        {editMode ? (
+          <textarea
+            rows={3}
+            value={localChanges}
+            onChange={(e) => setLocalChanges(e.target.value)}
+            placeholder="One change per line"
+            className="w-full px-2.5 py-1.5 rounded text-xs font-mono resize-none outline-none"
+            style={{
+              backgroundColor: 'var(--bg-inset)',
+              border: '1px solid var(--border-strong)',
+              color: 'var(--text-primary)',
+            }}
+          />
+        ) : (
+          changes && changes.length > 0 ? (
+            <div
+              className="px-3 py-2 rounded border text-xs space-y-1"
+              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}
+            >
+              {changes.map((c, i) => (
+                <div key={i} className="flex gap-1.5">
+                  <span style={{ color: 'var(--running)' }}>+</span>
+                  <span style={{ color: 'var(--text-secondary)' }}>{c}</span>
+                </div>
+              ))}
+            </div>
+          ) : null
+        )}
+      </div>
+
+      {/* Hyperparams */}
+      <div>
+        <div className="text-xs font-mono mb-0.5" style={{ color: 'var(--text-tertiary)' }}>
+          hyperparameters
+        </div>
+        {editMode ? (
+          <>
+            <textarea
+              rows={4}
+              value={localHyperparams}
+              onChange={(e) => { setLocalHyperparams(e.target.value); setHypError(null) }}
+              className="w-full px-2.5 py-1.5 rounded text-xs font-mono resize-none outline-none"
+              style={{
+                backgroundColor: 'var(--bg-inset)',
+                border: `1px solid ${hypError ? 'var(--danger)' : 'var(--border-strong)'}`,
+                color: 'var(--text-primary)',
+              }}
+            />
+            {hypError && (
+              <div className="text-xs mt-0.5" style={{ color: 'var(--danger)' }}>{hypError}</div>
+            )}
+          </>
+        ) : (
+          <div
+            className="px-3 py-2 rounded border text-xs font-mono"
+            style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)', color: 'var(--text-secondary)' }}
+          >
+            {Object.entries(hyperparams).length > 0
+              ? Object.entries(hyperparams).map(([k, v]) => (
+                  <div key={k}>
+                    <span style={{ color: 'var(--text-tertiary)' }}>{k}: </span>
+                    <span>{String(v)}</span>
+                  </div>
+                ))
+              : '—'}
+          </div>
+        )}
+      </div>
+
+      {/* Rationale */}
+      <div>
+        <div className="text-xs font-mono mb-0.5" style={{ color: 'var(--text-tertiary)' }}>
+          rationale
+        </div>
+        {editMode ? (
+          <textarea
+            rows={2}
+            value={rationale}
+            onChange={(e) => onEditsChange({ ...edits, rationale: e.target.value })}
+            className="w-full px-2.5 py-1.5 rounded text-xs font-mono resize-none outline-none"
+            style={{
+              backgroundColor: 'var(--bg-inset)',
+              border: '1px solid var(--border-strong)',
+              color: 'var(--text-primary)',
+            }}
+          />
+        ) : rationale ? (
+          <div
+            className="text-xs px-3 py-2 rounded border italic"
+            style={{
+              borderColor: 'var(--border)',
+              backgroundColor: 'var(--bg-inset)',
+              color: 'var(--text-tertiary)',
+              lineHeight: '1.6',
+            }}
+          >
+            {rationale}
+          </div>
+        ) : null}
+      </div>
 
       {/* Version mode selector */}
       <div className="flex items-center gap-2">
@@ -723,11 +935,17 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
 
   const plan = request.plan
   const isNextIter = plan.kind === 'next_iteration'
+  const isFixExhausted = plan.kind === 'fix_exhausted'
 
   // Version mode state for next_iteration cards (user can toggle before approving)
   const [versionMode, setVersionMode] = useState<'modify' | 'branch'>(
     (plan.version_mode as string) === 'branch' ? 'branch' : 'modify'
   )
+  // Editable proposal fields for next_iteration cards
+  const [nextIterEdits, setNextIterEdits] = useState<NextIterEdits>({})
+  // Extra attempts state for fix_exhausted cards
+  const [extraAttempts, setExtraAttempts] = useState(3)
+  const [fixGuidance, setFixGuidance] = useState('')
 
   // Fix 3: read experiment_id from top-level OR from inside plan
   const expId = request.experiment_id ?? (request.plan?.experiment_id as number | undefined) ?? 0
@@ -736,8 +954,13 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
     mutationFn: () => {
       if (!activeProjectId) throw new Error('No active project')
       if (expId === 0) throw new Error('No experiment ID — is the demo pipeline running?')
-      // For next_iteration cards, pass the (possibly updated) version_mode back
-      const editedPlan = isNextIter ? { version_mode: versionMode } : undefined
+      // For next_iteration cards, pass version_mode + any user edits
+      // For fix_exhausted cards, pass extra_attempts
+      const editedPlan = isNextIter
+        ? { version_mode: versionMode, ...nextIterEdits }
+        : isFixExhausted
+        ? { extra_attempts: extraAttempts, user_guidance: fixGuidance.trim() || undefined }
+        : undefined
       return experimentsApi.approve(activeProjectId, expId, editedPlan)
     },
     onSuccess: () => {
@@ -787,8 +1010,94 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
         style={{ backgroundColor: 'rgba(52,211,153,0.07)', borderColor: 'rgba(52,211,153,0.3)' }}>
         <CheckCircle2 size={14} style={{ color: 'var(--running)' }} />
         <span className="text-sm" style={{ color: 'var(--running)' }}>
-          {isNextIter ? 'Approved — generating next iteration…' : 'Approved — pipeline continuing…'}
+          {isNextIter
+            ? 'Approved — generating next iteration…'
+            : isFixExhausted
+            ? `Extending fix cap — retrying with ${extraAttempts} more attempt${extraAttempts !== 1 ? 's' : ''}…`
+            : 'Approved — pipeline continuing…'}
         </span>
+      </div>
+    )
+  }
+
+  // ── Fix exhausted card — special compact layout ──────────────────────────
+  if (isFixExhausted) {
+    const attemptsUsed = plan.attempts_used as number ?? 0
+    const tracebackSummary = plan.traceback_summary as string ?? 'Unknown error'
+    return (
+      <div className="rounded border overflow-hidden"
+        style={{ backgroundColor: 'var(--bg-surface)', borderColor: 'rgba(239,68,68,0.4)' }}>
+        <div className="flex items-center gap-3 px-4 py-3 border-b"
+          style={{ borderColor: 'rgba(239,68,68,0.2)', backgroundColor: 'rgba(239,68,68,0.06)' }}>
+          <AlertTriangle size={13} style={{ color: 'var(--danger)' }} />
+          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+            Fix loop exhausted after {attemptsUsed} attempt{attemptsUsed !== 1 ? 's' : ''}
+          </span>
+        </div>
+        <div className="p-4 space-y-3">
+          <div className="text-xs px-3 py-2 rounded border font-mono"
+            style={{ borderColor: 'rgba(239,68,68,0.2)', backgroundColor: 'var(--bg-inset)', color: 'var(--danger)' }}>
+            {tracebackSummary}
+          </div>
+          <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+            Give ALFRED more attempts to fix this, or stop and fix manually.
+          </p>
+          <div className="flex items-center gap-2">
+            <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>Extra attempts:</span>
+            {[1, 3, 5].map((n) => (
+              <button key={n}
+                onClick={() => setExtraAttempts(n)}
+                className="px-2 py-0.5 rounded text-xs font-mono border transition-colors"
+                style={{
+                  borderColor: extraAttempts === n ? 'var(--accent)' : 'var(--border)',
+                  color: extraAttempts === n ? 'var(--accent)' : 'var(--text-tertiary)',
+                  backgroundColor: extraAttempts === n ? 'rgba(56,189,248,0.08)' : 'transparent',
+                }}>
+                +{n}
+              </button>
+            ))}
+          </div>
+          <div>
+            <p className="text-xs mb-1" style={{ color: 'var(--text-tertiary)' }}>
+              Guidance for ALFRED <span style={{ opacity: 0.6 }}>(optional — tell it what to try differently)</span>
+            </p>
+            <textarea
+              value={fixGuidance}
+              onChange={(e) => setFixGuidance(e.target.value)}
+              placeholder="e.g. Don't load MNIST as .npy — use torchvision.datasets.MNIST instead"
+              rows={2}
+              className="w-full rounded border px-2 py-1.5 text-xs font-mono resize-none"
+              style={{
+                borderColor: fixGuidance ? 'var(--accent)' : 'var(--border)',
+                backgroundColor: 'var(--bg-inset)',
+                color: 'var(--text-primary)',
+                outline: 'none',
+              }}
+            />
+          </div>
+          {errorMsg && (
+            <div className="text-xs px-2 py-1 rounded"
+              style={{ backgroundColor: 'rgba(239,68,68,0.1)', color: 'var(--danger)' }}>
+              {errorMsg}
+            </div>
+          )}
+          <div className="flex gap-2">
+            <button
+              onClick={() => approveMutation.mutate()}
+              disabled={approveMutation.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors disabled:opacity-50"
+              style={{ backgroundColor: 'var(--accent)', color: '#0f172a' }}>
+              {approveMutation.isPending ? 'Extending…' : `Try +${extraAttempts} more`}
+            </button>
+            <button
+              onClick={() => rejectMutation.mutate()}
+              disabled={rejectMutation.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors disabled:opacity-50"
+              style={{ color: 'var(--text-tertiary)', border: '1px solid var(--border)' }}>
+              Stop
+            </button>
+          </div>
+        </div>
       </div>
     )
   }
@@ -831,6 +1140,8 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
             plan={plan}
             versionMode={versionMode}
             onVersionModeChange={setVersionMode}
+            edits={nextIterEdits}
+            onEditsChange={setNextIterEdits}
           />
         ) : (
           <>
@@ -979,6 +1290,88 @@ function PersistedMessageRow({ message, isStreaming }: { message: PersistedMessa
 }
 
 // ---------------------------------------------------------------------------
+// RunExperimentButton — shown when stage=run, project is bound, system is idle
+// ---------------------------------------------------------------------------
+
+let _runOptimisticId = -(1 << 28)
+
+function RunExperimentButton() {
+  const activeProjectId = useStore((s) => s.activeProjectId)
+  const activeProjectStage = useStore((s) => s.activeProjectStage)
+  const progress = useStore((s) => s.progress)
+  const approvalRequest = useStore((s) => s.approvalRequest)
+  const streamingMsgId = useStore((s) => s.streamingMsgId)
+  const selectedModel = useStore((s) => s.selectedModel)
+  const appendPersistedMessage = useStore((s) => s.appendPersistedMessage)
+  const btnRef = useRef<HTMLDivElement>(null)
+
+  const { data: projects } = useQuery({
+    queryKey: ['projects'],
+    queryFn: projectsApi.list,
+  })
+  const activeProject = projects?.find((p) => p.id === activeProjectId)
+  const isBound = !!(activeProject?.conda_env && activeProject?.experiment_folder)
+
+  const isIdle = progress.status === 'idle' || progress.status === 'done'
+  const visible =
+    activeProjectStage === 'run' &&
+    isBound &&
+    isIdle &&
+    approvalRequest === null &&
+    streamingMsgId === null &&
+    !!activeProjectId
+
+  // Scroll into view whenever the button becomes visible
+  useEffect(() => {
+    if (visible && btnRef.current) {
+      btnRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }
+  }, [visible])
+
+  if (!visible) return null
+
+  const handleRun = () => {
+    if (!selectedModel) return
+    appendPersistedMessage({
+      id: _runOptimisticId--,
+      project_id: activeProjectId!,
+      role: 'user',
+      content: 'run the experiment',
+      created_at: new Date().toISOString(),
+      kind: 'chat',
+      metadata_json: '{}',
+    })
+    window.dispatchEvent(
+      new CustomEvent('alfred:send', {
+        detail: {
+          type: 'chat',
+          content: 'run the experiment',
+          model: selectedModel,
+          message_id: `run-${Date.now()}`,
+        },
+      })
+    )
+  }
+
+  return (
+    <div ref={btnRef} className="px-4 py-3 flex justify-center">
+      <button
+        onClick={handleRun}
+        className="flex items-center gap-2 px-5 py-2 rounded border text-sm font-medium transition-colors"
+        style={{
+          backgroundColor: 'rgba(56,189,248,0.08)',
+          borderColor: 'rgba(56,189,248,0.35)',
+          color: 'var(--accent)',
+        }}
+      >
+        <Play size={13} />
+        Run Experiment
+      </button>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Skip hypothesis action — shown when project is in hypothesis stage with no messages
 // ---------------------------------------------------------------------------
 
@@ -1097,16 +1490,33 @@ export function ChatThread() {
   const handleScroll = useCallback(() => {
     const el = scrollContainerRef.current
     if (!el) return
-    userScrolledUp.current = el.scrollHeight - el.scrollTop - el.clientHeight > 80
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    userScrolledUp.current = dist > 80
   }, [])
 
-  // Scroll to bottom on new content — instant to avoid competing smooth-scroll animations
-  useEffect(() => {
-    if (userScrolledUp.current) return
+  const scrollToBottom = useCallback(() => {
     const el = scrollContainerRef.current
     if (!el) return
     el.scrollTop = el.scrollHeight
-  }, [persistedMessages, streamingMessages, logEntries, approvalRequest])
+  }, [])
+
+  // When ALFRED starts streaming a new message, always jump to bottom so the
+  // user sees the response (regardless of whether they had scrolled up).
+  useEffect(() => {
+    if (streamingMsgId !== null) {
+      userScrolledUp.current = false
+      scrollToBottom()
+    }
+  }, [streamingMsgId, scrollToBottom])
+
+  // Scroll to bottom when persisted messages or approval state changes,
+  // but only when user hasn't scrolled up to read history.
+  // Deliberately excludes logEntries — those update on every experiment log line
+  // and would fight with reading history.
+  useEffect(() => {
+    if (userScrolledUp.current) return
+    scrollToBottom()
+  }, [persistedMessages, streamingMessages, approvalRequest, activePlots, scrollToBottom])
 
   if (!activeProjectId) {
     return (
@@ -1176,6 +1586,9 @@ export function ChatThread() {
 
           {/* ALFRED working indicator — visible when backend is running but not streaming */}
           <WorkingIndicator />
+
+          {/* Run Experiment button — appears when plan is approved, project is bound, system idle */}
+          <RunExperimentButton />
 
           {/* Skip research — persists during active hypothesis stage even with messages */}
           {activeProjectStage === 'hypothesis' && approvalRequest === null && (

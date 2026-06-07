@@ -13,7 +13,8 @@ Sub-step 7.2: code generation, approval gate, execution, metric/phase/plot
 Sub-step 7.3: error-fix loop (auto-apply, no gate).
   - ModuleNotFoundError  → conda/pip install + retry
   - Generic errors       → fixer role (+ ddgs search on attempt ≥ 1)
-  - Cap at MAX_FIX_ATTEMPTS = 3; diff shown in thinking tab for transparency
+  - Configurable fix cap (config.max_fix_attempts, default 3); when exhausted
+    the user is offered an approval card to extend the cap for the current run
   - Mistakes recorded in the memory store
 Sub-step 7.5: next-iteration loop + versioning.
   - _propose_next_iteration() → collaborator role generates JSON proposal
@@ -24,6 +25,7 @@ Sub-step 7.5: next-iteration loop + versioning.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import logging
@@ -65,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_FIX_ATTEMPTS = 3
+_DEFAULT_MAX_FIX_ATTEMPTS = 3  # overridden per-instance from config.max_fix_attempts
 LOG_FLUSH_EVERY = 50
 TRACEBACK_WINDOW = 60   # lines kept for error diagnosis
 
@@ -117,6 +119,13 @@ class RunnerAgent:
 
         self.client = make_client(model, project_id=self.pid_str, ws_manager=ws_manager)
 
+        # Load max_fix_attempts from config; falls back to default if config unavailable
+        try:
+            from alfred.config import get_config
+            self.max_fix_attempts: int = get_config().max_fix_attempts
+        except Exception:
+            self.max_fix_attempts = _DEFAULT_MAX_FIX_ATTEMPTS
+
         # Run-time state — populated during _run_pipeline; reset between iterations
         self._machine: ExperimentStateMachine | None = None
         self._executor: CondaExecutor | None = None
@@ -149,6 +158,26 @@ class RunnerAgent:
 
         try:
             await self._run_pipeline(user_content, asst_msg_id)
+        except asyncio.CancelledError:
+            # Reset any in-flight experiment back to "planned" so the user can re-run
+            if self._active_exp_id is not None:
+                try:
+                    with Session(get_engine()) as _s:
+                        _exp = _s.get(Experiment, self._active_exp_id)
+                        if _exp is not None and _exp.status == ExperimentStatus.running:
+                            _exp.status = ExperimentStatus.planned
+                            _exp.started_at = None
+                            _s.add(_exp)
+                            _s.commit()
+                except Exception as _exc:
+                    logger.warning("Could not reset experiment on cancel: %s", _exc)
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": "⏹ Stopped by user.", "phase": "run",
+            })
+            if self._machine is not None:
+                await self._machine.report_done("Stopped")
+            unregister_machine(self.project_id)
+            await self.ws.send(self.pid_str, "stopped", {"summary": "Stopped by user"})  # type: ignore[attr-defined]
         except Exception as exc:
             logger.exception("RunnerAgent pipeline failed: %s", exc)
             await self.ws.broadcast_error(  # type: ignore[attr-defined]
@@ -209,20 +238,29 @@ class RunnerAgent:
                 S3Sub.WRITING_CODE, label="Writing experiment code…", stage=Stage.RUN
             )
             await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
-                "message": f"[CODE GEN] Writing iteration {iteration} experiment script…",
-                "phase": "run",
+                "message": (
+                    f"━━ Iteration {iteration} — code generation ━━\n"
+                    f"Model: {self.model}\n"
+                    f"Objective: {str(self._plan.get('objective', '—'))[:120]}"
+                ),
+                "phase": "generate",
             })
             # Keep Ollama model loaded during long pipeline runs
             await keepalive_model(self.model, keep_alive="30m")
 
             prev_code = _load_prev_script(exp_folder, iteration)
-            code = await self._generate_code(self._plan, iteration, exp_folder)
+            code = await self._generate_code(self._plan, iteration, exp_folder, prev_code=prev_code)
             self._script_code = get_preamble() + "\n" + code
 
             script_path = _script_path_for(exp_folder, iteration, self._plan)
             script_path.parent.mkdir(parents=True, exist_ok=True)
             script_path.write_text(self._script_code)
             self._script_path = script_path
+
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": f"Code written → {script_path}  ({len(self._script_code)} chars)",
+                "phase": "generate",
+            })
 
             diff_text = _compute_diff(prev_code, self._script_code, script_path.name)
 
@@ -275,6 +313,14 @@ class RunnerAgent:
 
             # ── 5. Execute (with error-fix loop on failure) ─────────────────────
             await self._machine.transition(S3Sub.PREPROCESSING, label="Preprocessing")
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": (
+                    f"━━ Executing script ━━\n"
+                    f"  conda env: {conda_env}\n"
+                    f"  script:    {script_path.name}"
+                ),
+                "phase": "run",
+            })
             exit_code = await self._executor.run_script(script_path, self._on_log_line)
             await self._flush_logs(self._active_exp_id)
             await self._flush_metrics(self._active_exp_id)
@@ -308,7 +354,7 @@ class RunnerAgent:
     # ── Code generation ────────────────────────────────────────────────────────
 
     async def _generate_code(
-        self, plan: dict, iteration: int, exp_folder: Path
+        self, plan: dict, iteration: int, exp_folder: Path, prev_code: str = ""
     ) -> str:
         """Generate experiment code using the coder role."""
         dataset_uris = _extract_dataset_uris(plan)
@@ -316,6 +362,16 @@ class RunnerAgent:
             "\nDataset linked at: data/ (relative to script directory)"
             if dataset_uris else ""
         )
+
+        prev_code_section = ""
+        if prev_code and iteration > 1:
+            prev_code_section = f"""
+PREVIOUS ITERATION CODE (iteration {iteration - 1}) — build on this, don't start from scratch:
+```python
+{prev_code[:4000]}
+```
+Apply the changes from the plan above. Preserve working patterns from the previous code.
+"""
 
         prompt = f"""\
 You are writing iteration {iteration} of this ML experiment.
@@ -346,13 +402,27 @@ REQUIRED — use GPU if available (always include this at the top of training co
   print(f"Using device: {{device}}", flush=True)
   # Move models and tensors: model.to(device), tensor.to(device)
 
-REQUIRED — save at least one plot:
-  plt.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), "loss_curve.png"))
+PLOTTING PATTERN — always collect losses in a list, then plot AFTER the training loop:
+  import matplotlib.pyplot as plt
 
+  train_losses = []
+  for epoch in range(epochs):
+      loss = train_one_epoch(...)
+      train_losses.append(float(loss))
+      log_metric("train_loss", float(loss), step=epoch)
+
+  # Plot AFTER training — not before, not during
+  plt.figure(figsize=(8, 5))
+  plt.plot(train_losses, label="Training Loss")
+  plt.xlabel("Epoch"); plt.ylabel("Loss")
+  plt.title("Training Loss Curve"); plt.legend(); plt.tight_layout()
+  plt.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), "loss_curve.png"))
+  log_metric("final_loss", train_losses[-1], step=epochs - 1)
+{prev_code_section}
 Write ONLY the Python code, no markdown fences, no explanatory prose.
 """
         messages = [{"role": "user", "content": prompt}]
-        response = await self.client.chat(Role.CODER, messages, message_id="")
+        response = await self.client.chat_silent(Role.CODER, messages)
         return _strip_code_fences(response)
 
     # ── Log line callback ──────────────────────────────────────────────────────
@@ -423,33 +493,59 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
     # ── Error-fix loop (Sub-step 7.3) ─────────────────────────────────────────
 
     async def _error_fix_loop(
-        self, traceback: str, *, attempt: int
+        self, traceback: str, *, attempt: int, user_guidance: str = ""
     ) -> tuple[bool, str]:
         """
         Auto-apply error fixes without an approval gate.
         Diff is shown in the thinking tab for transparency.
-        Caps at MAX_FIX_ATTEMPTS; records each fix as a memory mistake.
+        Caps at self.max_fix_attempts (config.max_fix_attempts, default 3).
+        When exhausted, shows an approval card offering to extend the cap.
 
         Returns (True, interpretation_text) if ultimately successful,
-        (False, "") if all attempts exhausted.
+        (False, "") if all attempts exhausted and user declines extension.
         """
         assert self._machine is not None
         assert self._executor is not None
         assert self._script_path is not None
 
-        if attempt >= MAX_FIX_ATTEMPTS:
+        if attempt >= self.max_fix_attempts:
+            # Offer the user a chance to extend the fix cap for this run
+            traceback_short = next(
+                (l for l in traceback.splitlines() if "Error" in l or "Exception" in l),
+                traceback[:200],
+            )
+            response = await self._machine.transition(
+                S3Sub.AWAITING_APPROVAL,
+                plan={
+                    "kind": "fix_exhausted",
+                    "attempts_used": attempt,
+                    "traceback_summary": traceback_short,
+                    "experiment_id": self._active_exp_id,
+                },
+                label=f"Fix cap reached ({attempt} attempts) — awaiting extension",
+            )
+            if response and response.approved:
+                extra = int((response.edited_plan or {}).get("extra_attempts", 3))
+                new_guidance = str((response.edited_plan or {}).get("user_guidance", "")).strip()
+                self.max_fix_attempts = attempt + max(extra, 1)
+                msg = f"Fix cap extended to {self.max_fix_attempts} attempts"
+                if new_guidance:
+                    msg += f" — with guidance: {new_guidance[:100]}"
+                await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                    "message": msg + " — retrying…",
+                    "phase": "fix",
+                })
+                return await self._error_fix_loop(
+                    traceback, attempt=attempt, user_guidance=new_guidance
+                )
+            # User declined — give up
             await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
                 "message": (
-                    f"⛔  Stuck after {MAX_FIX_ATTEMPTS} fix attempts — human review needed.\n"
-                    "Check the traceback in the thinking tab and fix manually."
+                    f"⛔  Fix loop stopped after {attempt} attempts.\n"
+                    "Review the traceback in the thinking tab and fix manually."
                 ),
                 "phase": "fix",
             })
-            await self.ws.broadcast_error(  # type: ignore[attr-defined]
-                self.pid_str,
-                human_message=f"Experiment failed after {MAX_FIX_ATTEMPTS} automatic fix attempts.",
-                remediation="Review the logs in the thinking tab and fix the script manually.",
-            )
             await self._mark_experiment_failed()
             await self._machine.report_done("Fix attempts exhausted")
             unregister_machine(self.project_id)
@@ -457,7 +553,7 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
 
         await self._machine.transition(
             S3Sub.DIAGNOSING_ERROR,
-            label=f"Diagnosing error (attempt {attempt + 1}/{MAX_FIX_ATTEMPTS})",
+            label=f"Diagnosing error (attempt {attempt + 1}/{self.max_fix_attempts})",
         )
 
         error_type, extra = _classify_error(traceback)
@@ -475,7 +571,8 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
             return await self._fix_missing_module(extra, traceback, attempt)
         else:
             return await self._fix_with_llm(
-                traceback, traceback_first_line, error_type, attempt
+                traceback, traceback_first_line, error_type, attempt,
+                user_guidance=user_guidance,
             )
 
     async def _fix_missing_module(
@@ -523,57 +620,239 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
         traceback_first_line: str,
         error_type: str,
         attempt: int,
+        user_guidance: str = "",
     ) -> tuple[bool, str]:
-        """Generate a corrected script via the fixer role and retry."""
+        """
+        Agentic error-fix loop: LLM is told it has web search capability and
+        decides autonomously whether to use it.
+
+        Flow per attempt:
+          1. Load past mistakes from memory store (explicit, not relying on system prompt).
+          2. ASSESSMENT call (chat_silent): LLM sees error + past mistakes + search option.
+             LLM responds with EITHER a fix (SEARCH/REPLACE or full script)
+             OR "NEED_SEARCH: <query>" if it wants web results first.
+          3. If NEED_SEARCH: run the search, then FIXER call (chat_log_stream) with results.
+             Otherwise: use the assessment response directly as the fix.
+        """
         assert self._machine is not None
         assert self._executor is not None
         assert self._script_path is not None
 
         await self._machine.transition(S3Sub.FIXING, label="Fixing script")
 
-        # Optionally search for context on second attempt+
+        await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+            "message": (
+                f"[FIX] Attempt {attempt + 1}/{self.max_fix_attempts}\n"
+                f"{'─' * 60}\n"
+                f"{traceback[-3000:]}"
+            ),
+            "phase": "fix",
+            "message_id": f"fix-tb-{attempt}",
+        })
+
+        # ── Load past mistakes from memory (last 5, most recent first) ────────
+        past_mistakes_block = _load_past_mistakes(self.project_id)
+
+        old_code = self._script_code
+        # Strip the injected preamble so the LLM only sees (and rewrites) the
+        # experiment body.  This prevents double-preamble corruption on full rewrites.
+        preamble = get_preamble()
+        experiment_body = (
+            old_code[len(preamble):].lstrip("\n")
+            if old_code.startswith(preamble)
+            else old_code
+        )
+        last_tb_lines = "\n".join(traceback.splitlines()[-30:])
+
+        # ── ASSESSMENT CALL — LLM decides: fix directly OR request search ─────
+        assessment_prompt = f"""\
+You are debugging a Python ML experiment that crashed. You have access to a web search tool.
+
+NOTE: The standard preamble (sys/os/logging/matplotlib setup, log_metric, plt.savefig patch)
+is already injected automatically — do NOT include it in any fix.
+
+ERROR:
+{traceback_first_line}
+
+LAST 30 LINES OF OUTPUT:
+{last_tb_lines}
+
+EXPERIMENT BODY (first 4000 chars — preamble already stripped):
+```python
+{experiment_body[:4000]}
+```
+{past_mistakes_block}{f"USER GUIDANCE (from researcher — follow this precisely):{chr(10)}{user_guidance}{chr(10)}{chr(10)}" if user_guidance else ""}DECISION:
+- If you can fix this confidently from your training knowledge (common Python/ML errors,
+  standard library issues, typical shape mismatches, etc.) → provide the fix immediately
+  using SEARCH/REPLACE blocks or a full rewrite of the experiment body.
+- If this error likely requires current information (specific package version bugs,
+  undocumented behavior, community workarounds, recent API changes) → output EXACTLY:
+  NEED_SEARCH: <one targeted search query>
+  ...and nothing else on that line.
+
+Respond now.
+"""
+        await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+            "message": "[FIX] Assessing error — LLM deciding whether to search…",
+            "phase": "fix",
+        })
+        assessment = await self.client.chat_silent(
+            Role.FIXER, [{"role": "user", "content": assessment_prompt}]
+        )
+
+        # ── Parse NEED_SEARCH directive ────────────────────────────────────────
         search_context = ""
-        if attempt >= 1:
-            search_context = await _ddgs_search(
-                f"python fix: {traceback_first_line[:200]}"
-            )
+        search_query = _extract_search_directive(assessment)
+
+        if search_query:
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": f"[SEARCH] LLM requested search: {search_query}",
+                "phase": "fix",
+            })
+            search_context = await _ddgs_search(search_query)
             if search_context:
                 await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
-                    "message": f"[SEARCH] Found {len(search_context)} chars of context",
+                    "message": f"[SEARCH] Got {len(search_context)} chars of results",
+                    "phase": "fix",
+                })
+            else:
+                await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                    "message": "[SEARCH] No results — proceeding with LLM knowledge only",
                     "phase": "fix",
                 })
 
-        old_code = self._script_code
+        # ── FIX CALL (streaming, visible in Show Work) ─────────────────────────
         fix_prompt = f"""\
-The following Python experiment script crashed. Diagnose the root cause and produce \
-a complete corrected version of the script body (do NOT include the preamble lines \
-for log_metric, plt.savefig, logging, or matplotlib — those are injected automatically).
+Diagnose and fix this Python ML experiment script that crashed.
 
-ORIGINAL SCRIPT (preamble + body):
+IMPORTANT: The standard preamble (sys/os/logging/matplotlib/log_metric setup) is injected
+automatically BEFORE your code. Do NOT include preamble lines in your response.
+
+ERROR (most recent {len(traceback.splitlines())} lines):
+```
+{traceback[-2500:]}
+```
+EXPERIMENT BODY (preamble already stripped):
 ```python
-{old_code}
+{experiment_body[:6000]}
 ```
+{f"{chr(10)}WEB SEARCH RESULTS (query: {search_query}):{chr(10)}{search_context[:2000]}" if search_context else ""}
+{past_mistakes_block}{f"USER GUIDANCE (researcher instruction — follow this precisely):{chr(10)}{user_guidance}{chr(10)}" if user_guidance else ""}
+Respond with EXACTLY this structure — root cause on line 1, then the fix:
 
-ERROR TRACEBACK:
-```
-{traceback[-3000:]}
-```
-{f"SEARCH RESULTS:{chr(10)}{search_context[:2000]}" if search_context else ""}
+REASON: <one sentence — root cause>
+<<<SEARCH>>>
+<exact lines to replace — include 1-2 lines of surrounding context to be unique>
+<<<REPLACE>>>
+<corrected replacement — same indentation>
+<<<END>>>
 
-In one sentence, state what caused the error.
-Then write ONLY the corrected Python script body (no markdown fences, no preamble).
+Use one block per change. For large rewrites (>10 lines changed) write the complete
+corrected experiment body instead (starting from your imports, NOT the preamble).
 """
+        await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+            "message": f"\n[FIXER LLM — generating fix…]\n{'─' * 60}\n",
+            "phase": "fix",
+            "message_id": f"fix-hdr-{attempt}",
+        })
         messages = [{"role": "user", "content": fix_prompt}]
-        fix_response = await self.client.chat(Role.FIXER, messages, message_id="")
+        fix_response = await self.client.chat_log_stream(
+            Role.FIXER, messages,
+            log_phase="fix",
+            log_msg_id=f"fix-stream-{attempt}",
+        )
 
-        # Extract just the code part (fixer may include one-sentence diagnosis first)
-        fixed_code = _strip_code_fences(fix_response)
+        # ── Apply the fix ──────────────────────────────────────────────────────
+        # Patches are applied to experiment_body (preamble-stripped) only.
+        # Full rewrites are also expected to be preamble-free; preamble is prepended after.
+        new_full_script: str
+        try:
+            patched_body, had_blocks = _apply_patch(experiment_body, fix_response)
+            if had_blocks:
+                new_full_script = preamble + "\n" + patched_body
+            else:
+                # No valid patch blocks — treat LLM output as full experiment body rewrite.
+                # Strip any stray REASON: prefix and code fences before accepting.
+                candidate = _strip_llm_prefix(fix_response)
+                new_full_script = preamble + "\n" + candidate
+        except ValueError as patch_err:
+            logger.warning("Patch application failed (%s); requesting full rewrite", patch_err)
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": "[FIX] Patch mismatch — requesting explicit full rewrite",
+                "phase": "fix",
+            })
+            fallback_prompt = f"""\
+The previous patch could not be applied. Write ONLY the complete corrected experiment
+body — no preamble (no sys/os/logging/matplotlib imports), no markdown fences.
 
-        # Build the patched full script
-        new_full_script = get_preamble() + "\n" + fixed_code
+EXPERIMENT BODY (current):
+```python
+{experiment_body}
+```
+
+ERROR:
+```
+{traceback[-2000:]}
+```
+"""
+            fb_messages = [{"role": "user", "content": fallback_prompt}]
+            fb_response = await self.client.chat_silent(Role.FIXER, fb_messages)
+            candidate = _strip_llm_prefix(fb_response)
+            new_full_script = preamble + "\n" + candidate
+
+        # ── Sanity checks before writing ───────────────────────────────────────
+        # 1. Reject if nothing actually changed (no-op fix wastes an attempt).
+        if new_full_script.strip() == old_code.strip():
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": "[FIX] Fix produced no changes — skipping write, treating as failed attempt",
+                "phase": "fix",
+            })
+            return await self._error_fix_loop(traceback, attempt=attempt + 1, user_guidance=user_guidance)
+
+        # 2. Validate Python syntax before writing; corrupt scripts cause infinite loops.
+        try:
+            import ast as _ast
+            _ast.parse(new_full_script)
+        except SyntaxError as se:
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": (
+                    f"[FIX] Generated script has syntax error ({se}) — "
+                    "requesting clean rewrite"
+                ),
+                "phase": "fix",
+            })
+            clean_prompt = f"""\
+Write ONLY the corrected Python experiment body. No preamble, no markdown.
+The previous fix attempt introduced a syntax error: {se}
+
+EXPERIMENT BODY (original):
+```python
+{experiment_body}
+```
+
+ERROR:
+```
+{traceback[-1500:]}
+```
+"""
+            clean_resp = await self.client.chat_silent(
+                Role.FIXER, [{"role": "user", "content": clean_prompt}]
+            )
+            candidate = _strip_llm_prefix(clean_resp)
+            new_full_script = preamble + "\n" + candidate
+            # If still invalid after the clean rewrite, give up this attempt
+            try:
+                _ast.parse(new_full_script)
+            except SyntaxError as se2:
+                await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                    "message": f"[FIX] Second rewrite still invalid ({se2}) — attempt failed",
+                    "phase": "fix",
+                })
+                return await self._error_fix_loop(traceback, attempt=attempt + 1, user_guidance=user_guidance)
+
         diff_text = _compute_diff(old_code, new_full_script, self._script_path.name)
 
-        # Emit diff to thinking tab for transparency (no approval gate)
+        # Emit diff to log tab for transparency
         await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
             "message": (
                 f"[FIX DIFF — attempt {attempt + 1}]\n"
@@ -606,7 +885,7 @@ Then write ONLY the corrected Python script body (no markdown fences, no preambl
             return True, interp
         else:
             new_traceback = "\n".join(self._recent_lines)
-            return await self._error_fix_loop(new_traceback, attempt=attempt + 1)
+            return await self._error_fix_loop(new_traceback, attempt=attempt + 1, user_guidance=user_guidance)
 
     # ── DB flush helpers ───────────────────────────────────────────────────────
 
@@ -864,7 +1143,7 @@ RULES:
 
         proposal: dict = {}
         try:
-            raw = await self.client.chat_raw(
+            raw = await self.client.chat_silent(
                 Role.COLLABORATOR,
                 [{"role": "user", "content": proposal_prompt}],
             )
@@ -886,17 +1165,55 @@ RULES:
         proposal["experiment_id"] = exp.id
         proposal["iteration"] = exp.iteration + 1
 
-        # Transition to AWAITING_NEXT — blocks until user approves or rejects
-        gate_response = await self._machine.transition(
-            S3Sub.AWAITING_NEXT,
-            plan=proposal,
-            label=f"Iteration {exp.iteration + 1} proposal",
-        )
+        MAX_REPROPOSALS = 3
+        reproposal_count = 0
+        feedback_history = ""
 
-        if gate_response is None or not gate_response.approved:
-            await self._machine.report_done("No more iterations requested")
-            unregister_machine(self.project_id)
-            return False
+        while True:
+            # Transition to AWAITING_NEXT — blocks until user approves or rejects
+            gate_response = await self._machine.transition(
+                S3Sub.AWAITING_NEXT,
+                plan=proposal,
+                label=f"Iteration {exp.iteration + 1} proposal",
+            )
+
+            if gate_response is not None and gate_response.approved:
+                break  # user approved — continue below
+
+            # User rejected
+            feedback = gate_response.feedback if gate_response else ""
+            if not feedback or reproposal_count >= MAX_REPROPOSALS:
+                # No feedback = "stop here", or reproposal limit reached
+                await self._machine.report_done("No more iterations requested")
+                unregister_machine(self.project_id)
+                return False
+
+            # User provided feedback — regenerate proposal incorporating it
+            reproposal_count += 1
+            feedback_history += f"\nFeedback round {reproposal_count}: {feedback}"
+            await self.ws.broadcast_progress(
+                self.pid_str, stage=3, substage="proposing",
+                label=f"Revising iteration proposal…", current=0, total=0, status="running",
+            )
+            revised_prompt = proposal_prompt + f"""
+
+USER FEEDBACK ON PREVIOUS PROPOSAL:
+{feedback_history}
+
+Revise the proposal to address this feedback. Return the same JSON format.
+"""
+            try:
+                raw = await self.client.chat_silent(
+                    Role.COLLABORATOR,
+                    [{"role": "user", "content": revised_prompt}],
+                )
+                proposal = json.loads(_strip_code_fences(raw))
+            except Exception as exc:
+                logger.warning("Re-proposal generation failed: %s", exc)
+                # Keep the previous proposal if revision fails
+            proposal["kind"] = "next_iteration"
+            proposal["experiment_id"] = exp.id
+            proposal["iteration"] = exp.iteration + 1
 
         # Merge user edits (e.g. version_mode change) into the proposal
         edited = gate_response.edited_plan if gate_response.edited_plan is not None else {}
@@ -990,6 +1307,56 @@ def _compute_diff(old_code: str, new_code: str, filename: str) -> str:
     ))
 
 
+def _apply_patch(original: str, patch_text: str) -> tuple[str, bool]:
+    """
+    Apply <<<SEARCH>>> / <<<REPLACE>>> / <<<END>>> blocks from patch_text to original.
+    <<<END>>> is optional: the parser also accepts blocks terminated by the next
+    <<<SEARCH>>> or end-of-string.
+
+    Returns (patched_code, True)  — all non-trivial blocks matched and applied.
+    Returns (original, False)     — no non-trivial blocks found; caller should treat
+                                    LLM output as a full-script rewrite instead.
+    Raises ValueError              — blocks were found but at least one SEARCH string
+                                    could not be located in original.
+    """
+    # Accept <<<END>>> as delimiter OR next <<<SEARCH>>> OR end-of-string.
+    blocks = re.findall(
+        r'<<<SEARCH>>>\n(.*?)\n?<<<REPLACE>>>\n(.*?)(?:\n?<<<END>>>|(?=\n<<<SEARCH>>>)|\Z)',
+        patch_text,
+        re.DOTALL,
+    )
+    if not blocks:
+        return original, False
+
+    result = original
+    applied_any = False
+    for search_raw, replace_raw in blocks:
+        # Skip no-op blocks (SEARCH == REPLACE — LLM hallucinated an identical change)
+        if search_raw.strip() == replace_raw.strip():
+            logger.debug("_apply_patch: skipping no-op block")
+            continue
+
+        applied = False
+        # Try progressively looser matches: exact → strip trailing NL → strip all edge WS
+        for s, r in [
+            (search_raw, replace_raw),
+            (search_raw.rstrip('\n'), replace_raw.rstrip('\n')),
+            (search_raw.strip(), replace_raw.strip()),
+        ]:
+            if s and s in result:
+                result = result.replace(s, r, 1)
+                applied = True
+                applied_any = True
+                break
+        if not applied:
+            raise ValueError(
+                f"SEARCH block not found in script — patch cannot be applied.\n"
+                f"Block (first 200 chars): {search_raw[:200]!r}"
+            )
+
+    return (result, True) if applied_any else (original, False)
+
+
 def _extract_dataset_uris(plan: dict) -> list[str]:
     uris: list[str] = []
     for key in ("dataset", "datasets"):
@@ -1057,6 +1424,88 @@ async def _ddgs_search(query: str, max_results: int = 5) -> str:
     except Exception as exc:
         logger.debug("DDGS search failed for '%s': %s", query, exc)
         return ""
+
+
+def _strip_llm_prefix(text: str) -> str:
+    """
+    Strip LLM preamble from a full-rewrite response:
+    - Remove a leading "REASON: ..." line
+    - Strip markdown code fences (``` / ```python)
+    - If the response accidentally starts with preamble imports (import sys / import os /
+      logging.basicConfig), skip lines until we hit the actual experiment code
+    """
+    text = text.strip()
+
+    # Strip REASON: prefix line
+    lines = text.splitlines()
+    if lines and lines[0].strip().upper().startswith("REASON:"):
+        lines = lines[1:]
+    text = "\n".join(lines).strip()
+
+    # Strip code fences
+    text = _strip_code_fences(text)
+
+    # Strip any leftover preamble block: if the text starts looking like our
+    # standard preamble, skip to the first line after the preamble sentinel comment
+    # ("# ── Phase markers" or the blank line after logging setup).
+    _PREAMBLE_SENTINELS = (
+        "# ── Phase markers",
+        "# ── Logging",
+        "# ── ALFRED protocol helpers",
+        "matplotlib.use(",
+        "logging.basicConfig(",
+    )
+    preamble_lines = text.splitlines()
+    start_idx = 0
+    if preamble_lines and preamble_lines[0].strip() in ("import sys", "import os"):
+        for i, line in enumerate(preamble_lines):
+            if any(line.strip().startswith(s) for s in _PREAMBLE_SENTINELS):
+                # Find next non-comment, non-blank line after the preamble block
+                for j in range(i + 1, len(preamble_lines)):
+                    stripped = preamble_lines[j].strip()
+                    if stripped and not stripped.startswith("#"):
+                        start_idx = j
+                        break
+                break
+    return "\n".join(preamble_lines[start_idx:]).strip()
+
+
+def _load_past_mistakes(project_id: int, limit: int = 5) -> str:
+    """
+    Load the most recent mistake records for this project from the memory store.
+    Returns a formatted block for injection into fix prompts, or "".
+    """
+    try:
+        from alfred.memory.store import list_items  # noqa: PLC0415
+        from alfred.models.db_models import MemoryType  # noqa: PLC0415
+        with Session(get_engine()) as s:
+            items = list_items(
+                s,
+                project_id=project_id,
+                memory_type=MemoryType.mistake,
+                active_only=True,
+            )
+        if not items:
+            return ""
+        recent = list(items)[:limit]
+        lines = [f"- {item.content[:300]}" for item in recent]
+        return "\nPAST MISTAKES (avoid repeating these):\n" + "\n".join(lines) + "\n"
+    except Exception as exc:
+        logger.debug("_load_past_mistakes failed (non-fatal): %s", exc)
+        return ""
+
+
+def _extract_search_directive(text: str) -> str:
+    """
+    Check if the LLM responded with a NEED_SEARCH directive.
+    Returns the search query string, or "" if the LLM wants to fix directly.
+    """
+    for line in text.strip().splitlines()[:5]:
+        stripped = line.strip()
+        if stripped.upper().startswith("NEED_SEARCH:"):
+            query = stripped[len("NEED_SEARCH:"):].strip().strip('"').strip("'")
+            return query[:200]
+    return ""
 
 
 def _capture_mistake(project_id: int, content: str) -> None:

@@ -84,20 +84,20 @@ class ConnectionManager:
         current: int,
         total: int,
         status: str = "running",
+        model: str = "",
     ) -> None:
         """Convenience wrapper for the canonical progress payload shape (C7)."""
-        await self.send(
-            project_id,
-            "progress",
-            {
-                "stage": stage,
-                "substage": substage,
-                "label": label,
-                "current": current,
-                "total": total,
-                "status": status,
-            },
-        )
+        payload: dict = {
+            "stage": stage,
+            "substage": substage,
+            "label": label,
+            "current": current,
+            "total": total,
+            "status": status,
+        }
+        if model:
+            payload["model"] = model
+        await self.send(project_id, "progress", payload)
 
     async def broadcast_token(self, project_id: str, token: str, message_id: str = "") -> None:
         """Stream a single LLM token."""

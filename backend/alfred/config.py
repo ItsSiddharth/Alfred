@@ -34,6 +34,7 @@ class AlfredConfig(BaseModel):
     telemetry_opt_in: bool = False
     dataset_cache_path: str = ""  # defaults to <workspace>/datasets if empty
     research_num_queries: int = 1  # number of search queries per hypothesis run (1 = fast test, 5 = thorough)
+    max_fix_attempts: int = 3     # max automatic error-fix retries per experiment run
 
     @property
     def workspace(self) -> Path:

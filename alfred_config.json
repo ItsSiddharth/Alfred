@@ -3,5 +3,6 @@
   "default_model": "",
   "auto_approve_default": false,
   "telemetry_opt_in": false,
-  "dataset_cache_path": ""
+  "dataset_cache_path": "",
+  "max_fix_attempts": 3
 }

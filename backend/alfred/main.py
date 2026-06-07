@@ -43,6 +43,9 @@ from alfred.ws import manager
 
 logger = logging.getLogger(__name__)
 
+# Per-project background task registry — used by the stop handler to cancel generation
+_active_tasks: dict[str, "asyncio.Task[None]"] = {}
+
 # Marker that signals the hypothesis clarifying-questions phase is done
 _START_RESEARCH_MARKER = "[START_RESEARCH]"
 
@@ -169,6 +172,13 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str) -> None:
 
             if msg_type == "chat":
                 await _handle_chat(project_id, msg)
+            elif msg_type == "stop":
+                task = _active_tasks.pop(project_id, None)
+                if task and not task.done():
+                    task.cancel()
+                    # The task's CancelledError handler emits "stopped"
+                else:
+                    await manager.send(project_id, "stopped", {"summary": "Nothing running"})
             elif msg_type == "demo_pipeline":
                 asyncio.create_task(_handle_demo_pipeline(project_id, msg))
             else:
@@ -236,13 +246,17 @@ async def _handle_chat(project_id: str, msg: dict) -> None:  # noqa: C901
     if stage == ProjectStage.hypothesis:
         await _handle_chat_hypothesis(project_id, pid_int, model, content, message_id, project)
     elif stage == ProjectStage.setup:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _handle_chat_setup(project_id, pid_int, model, content, message_id, project)
         )
+        _active_tasks[project_id] = task
+        task.add_done_callback(lambda _: _active_tasks.pop(project_id, None))
     elif stage == ProjectStage.run:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _handle_chat_run(project_id, pid_int, model, content, message_id, project)
         )
+        _active_tasks[project_id] = task
+        task.add_done_callback(lambda _: _active_tasks.pop(project_id, None))
     else:
         await _handle_chat_plain(project_id, msg, pid_int, model, content, message_id)
 
@@ -312,11 +326,15 @@ async def _handle_chat_hypothesis(
         except Exception as exc:
             logger.warning("Could not create assistant placeholder: %s", exc)
 
-    # Emit msg_start
+    # Emit msg_start + progress so ProgressStrip shows active and Stop appears
     if asst_msg_id is not None:
         await manager.send(project_id, "msg_start", {
             "msg_id": asst_msg_id, "message_id": message_id,
         })
+    await manager.broadcast_progress(
+        project_id, stage=1, substage="generating",
+        label="Generating response…", current=0, total=0, status="running",
+    )
 
     # Stream clarifying-questions response (quick mode skips clarification)
     hypothesis_preamble = (
@@ -370,11 +388,20 @@ async def _handle_chat_hypothesis(
         # Launch hypothesis agent in background
         # Gather hypothesis text from the conversation
         hypothesis_text = await _extract_hypothesis_text(pid_int, content)
-        asyncio.create_task(
+        # Signal immediately so the progress strip shows activity before the
+        # research agent's first state_change arrives
+        await manager.broadcast_progress(
+            project_id, stage=1, substage="validating",
+            label="Starting hypothesis validation…", current=0, total=0, status="running",
+        )
+        research_task = asyncio.create_task(
             _run_hypothesis_agent(
                 project_id, pid_int, model, hypothesis_text, project.auto_approve
             )
         )
+        # Register so the Stop button can cancel this task while research runs
+        _active_tasks[project_id] = research_task
+        research_task.add_done_callback(lambda t: _active_tasks.pop(project_id, None))
 
 
 async def _extract_hypothesis_text(pid_int: int, latest_user_msg: str) -> str:
@@ -425,6 +452,12 @@ async def _run_hypothesis_agent(
                 auto_approve=auto_approve,
             )
             await agent.run(hypothesis, feedback=feedback)
+    except asyncio.CancelledError:
+        await manager.send(project_id_str, "stopped", {"summary": "Stopped"})
+        await manager.broadcast_progress(
+            project_id_str, stage=1, substage="idle",
+            label="Stopped", current=0, total=0, status="idle",
+        )
     except Exception as exc:
         logger.exception("Hypothesis agent background task failed: %s", exc)
         await manager.broadcast_error(
@@ -515,42 +548,54 @@ async def _handle_chat_setup(
                 asst_msg_id=asst_msg_id,
                 memory_block=extra_system,
             )
+
+        # Persist assistant response
+        if asst_msg_id is not None:
+            try:
+                with Session(engine) as session:
+                    row = session.get(Message, asst_msg_id)
+                    if row:
+                        row.content = full_response
+                        row.metadata_json = json.dumps({
+                            "model": model,
+                            "memory_tokens": len(extra_system) // 4,
+                            "memory_block": extra_system,
+                            "tool_calls": [],
+                        })
+                        session.add(row)
+                        session.commit()
+            except Exception as exc:
+                logger.warning("Could not update assistant message: %s", exc)
+
+        await manager.send(project_id, "done", {
+            "msg_id": asst_msg_id, "summary": "Response complete"
+        })
+
+        # If agent produced a plan, show a brief "preparing…" indicator during
+        # the DB operations inside _create_setup_approval before approval_request fires
+        if plan is not None:
+            await manager.broadcast_progress(
+                project_id, stage=2, substage="proposing",
+                label="Preparing plan card…", current=0, total=0, status="running",
+            )
+            await _create_setup_approval(
+                project_id, pid_int, model, plan, project.auto_approve
+            )
+
+    except asyncio.CancelledError:
+        await manager.send(project_id, "stopped", {
+            "msg_id": asst_msg_id, "summary": "Stopped",
+        })
     except OllamaError as exc:
         full_response = f"⚠️ {exc}"
         await manager.broadcast_error(project_id, human_message=str(exc),
             remediation="Ensure Ollama is running and the selected model is pulled.")
+        await manager.send(project_id, "done", {"msg_id": asst_msg_id})
     except Exception as exc:
         full_response = f"⚠️ Error in setup agent: {exc}"
         logger.exception("Setup agent error: %s", exc)
         await manager.broadcast_error(project_id, human_message=str(exc))
-
-    # Persist assistant response
-    if asst_msg_id is not None:
-        try:
-            with Session(engine) as session:
-                row = session.get(Message, asst_msg_id)
-                if row:
-                    row.content = full_response
-                    row.metadata_json = json.dumps({
-                        "model": model,
-                        "memory_tokens": len(extra_system) // 4,
-                        "memory_block": extra_system,
-                        "tool_calls": [],
-                    })
-                    session.add(row)
-                    session.commit()
-        except Exception as exc:
-            logger.warning("Could not update assistant message: %s", exc)
-
-    await manager.send(project_id, "done", {
-        "msg_id": asst_msg_id, "summary": "Response complete"
-    })
-
-    # If agent produced a plan, create the approval gate
-    if plan is not None:
-        await _create_setup_approval(
-            project_id, pid_int, model, plan, project.auto_approve
-        )
+        await manager.send(project_id, "done", {"msg_id": asst_msg_id})
 
 
 async def _create_setup_approval(
@@ -761,8 +806,7 @@ async def _handle_chat_run(
         )
         return
 
-    # Persist user message
-    asst_msg_id: int | None = None
+    # Always persist user message (needed for history)
     with Session(engine) as session:
         try:
             user_row = Message(
@@ -774,38 +818,36 @@ async def _handle_chat_run(
         except Exception as exc:
             logger.warning("Could not persist user message (run stage): %s", exc)
 
-        try:
-            asst_row = Message(
-                project_id=pid_int, role=MessageRole.assistant,
-                content="", kind=MessageKind.chat, metadata_json="{}",
-            )
-            session.add(asst_row)
-            session.commit()
-            session.refresh(asst_row)
-            asst_msg_id = asst_row.id
-        except Exception as exc:
-            logger.warning("Could not create assistant placeholder (run stage): %s", exc)
-
-    if asst_msg_id is not None:
-        await manager.send(project_id, "msg_start", {
-            "msg_id": asst_msg_id, "message_id": message_id,
-        })
-
     # Route: DISCUSS if experiment running or no run intent
-    if experiment_running:
+    if experiment_running or not run_intent:
+        # Discussion needs its own assistant placeholder
+        asst_msg_id: int | None = None
+        with Session(engine) as session:
+            try:
+                asst_row = Message(
+                    project_id=pid_int, role=MessageRole.assistant,
+                    content="", kind=MessageKind.chat, metadata_json="{}",
+                )
+                session.add(asst_row)
+                session.commit()
+                session.refresh(asst_row)
+                asst_msg_id = asst_row.id
+            except Exception as exc:
+                logger.warning("Could not create assistant placeholder (discuss): %s", exc)
+
+        if asst_msg_id is not None:
+            await manager.send(project_id, "msg_start", {
+                "msg_id": asst_msg_id, "message_id": message_id,
+            })
+
+        hint = "An experiment is currently running — ALFRED will discuss while it proceeds." if experiment_running else ""
         await _research_discussion(
             project_id, pid_int, model, content, message_id, asst_msg_id, project,
-            hint="An experiment is currently running — ALFRED will discuss while it proceeds.",
+            hint=hint,
         )
         return
 
-    if not run_intent:
-        await _research_discussion(
-            project_id, pid_int, model, content, message_id, asst_msg_id, project,
-        )
-        return
-
-    # RUN intent — delegate to RunnerAgent
+    # RUN intent — delegate to RunnerAgent (no assistant placeholder; runner manages its own messages)
     try:
         from alfred.agents.runner import RunnerAgent  # noqa: PLC0415
         from alfred.db import get_engine  # noqa: PLC0415
@@ -819,7 +861,10 @@ async def _handle_chat_run(
                 db_session=session,
                 auto_approve=project.auto_approve,
             )
-            await agent.run(content, asst_msg_id=asst_msg_id)
+            await agent.run(content, asst_msg_id=None)
+    except asyncio.CancelledError:
+        await manager.send(project_id, "stopped", {"summary": "Stopped"})
+        return
     except ImportError:
         placeholder = (
             "✓ Project is bound. "
@@ -827,19 +872,11 @@ async def _handle_chat_run(
             f"folder: `{project.experiment_folder}`\n\n"
             "The experiment runner (Stage 7.2) is not yet built."
         )
-        if asst_msg_id is not None:
-            with Session(engine) as session:
-                row = session.get(Message, asst_msg_id)
-                if row:
-                    row.content = placeholder
-                    session.add(row)
-                    session.commit()
-            await manager.send(project_id, "token", {
-                "token": placeholder, "msg_id": asst_msg_id,
-            })
-        await manager.send(project_id, "done", {
-            "msg_id": asst_msg_id, "summary": "Ready",
-        })
+        await manager.broadcast_error(
+            project_id,
+            human_message=placeholder,
+            remediation="",
+        )
     except Exception as exc:
         logger.exception("RunnerAgent failed: %s", exc)
         await manager.broadcast_error(
@@ -847,7 +884,6 @@ async def _handle_chat_run(
             human_message=f"Runner error: {exc}",
             remediation="Check the backend terminal for the full traceback.",
         )
-        await manager.send(project_id, "done", {"msg_id": asst_msg_id})
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +995,11 @@ you do not need to prompt them for this.
 
     # Append the current message to history
     history.append({"role": "user", "content": content})
+
+    await manager.broadcast_progress(
+        project_id, stage=3, substage="discussing",
+        label="Generating response…", current=0, total=0, status="running",
+    )
 
     client = make_client(model, project_id=project_id, ws_manager=manager)
     try:

@@ -86,6 +86,40 @@ function MetricChart({
   const data = buildChartData(curves, metricName)
   if (data.length === 0) return null
 
+  // Single data point — show a value badge instead of a useless single-point chart
+  if (data.length === 1) {
+    const row = data[0]
+    return (
+      <div className="mb-4">
+        <div className="text-xs font-mono mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+          {metricName}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {iterIds.map((iter, i) => {
+            const val = row[`iter ${iter}`]
+            if (val == null) return null
+            const color = ITER_COLORS[i % ITER_COLORS.length]
+            return (
+              <div
+                key={iter}
+                className="flex items-center gap-2 px-3 py-1.5 rounded text-xs font-mono"
+                style={{
+                  backgroundColor: 'var(--bg-inset)',
+                  border: `1px solid ${color}40`,
+                }}
+              >
+                <span style={{ color: 'var(--text-tertiary)' }}>iter {iter}</span>
+                <span style={{ color, fontWeight: 600, fontSize: 13 }}>
+                  {val % 1 === 0 ? val : val.toFixed(4)}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="mb-4">
       <div className="text-xs font-mono mb-1.5" style={{ color: 'var(--text-secondary)' }}>

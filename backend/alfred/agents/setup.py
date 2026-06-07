@@ -31,6 +31,7 @@ from alfred.models.db_models import (
     Experiment,
     ExperimentStatus,
     Message,
+    MessageKind,
     MessageRole,
 )
 from alfred.state_machine.machine import (
@@ -167,6 +168,12 @@ class SetupAgent:
         # After turn 3+, check if plan is ready
         plan: dict | None = None
         if turn_count >= MIN_TURNS_BEFORE_PROPOSAL:
+            # Signal the frontend so the user sees feedback instead of silence
+            # while the plan-readiness LLM call runs (typically 1–3 s).
+            await self.ws.broadcast_progress(
+                self.pid_str, stage=2, substage="checking",
+                label="Checking plan readiness…", current=0, total=0, status="running",
+            )
             plan = await self._check_plan_ready(
                 messages + [{"role": "assistant", "content": response}]
             )
@@ -191,13 +198,32 @@ class SetupAgent:
             self.session.commit()
 
         await machine.transition(S2Sub.FINALIZED, label="Plan approved")
-        # Advance to run stage and unregister machine
         await machine.advance_to_stage(Stage.RUN)
         unregister_machine(self.project_id)
 
-        await self.ws.send(self.pid_str, "log", {
-            "message": "Experiment plan approved. Advancing to run stage.",
-            "phase": "setup",
+        # Persist a guidance message directly in the chat thread (not the log feed)
+        guidance = (
+            "✓ **Plan approved** — experiment ready.\n\n"
+            "Set your **conda environment** and **experiment folder** in the sidebar "
+            "(expand the project panel on the left). A **Run Experiment** button will appear here once the environment is configured."
+        )
+        guidance_row = Message(
+            project_id=self.project_id,
+            role=MessageRole.assistant,
+            content=guidance,
+            kind=MessageKind.chat,
+            metadata_json="{}",
+        )
+        self.session.add(guidance_row)
+        self.session.commit()
+        self.session.refresh(guidance_row)
+
+        await self.ws.send(self.pid_str, "msg_start", {"msg_id": guidance_row.id})
+        await self.ws.send(self.pid_str, "token", {
+            "token": guidance, "message_id": str(guidance_row.id),
+        })
+        await self.ws.send(self.pid_str, "done", {
+            "msg_id": guidance_row.id, "summary": "Plan approved — ready to run",
         })
 
     # ── Internal helpers ───────────────────────────────────────────────────────

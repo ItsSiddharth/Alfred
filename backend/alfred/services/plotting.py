@@ -38,11 +38,14 @@ def log_metric(name: str, value: float, step: int = 0) -> None:
     """Emit a named scalar metric; parsed by the RunnerAgent."""
     print(f"ALFRED_METRIC: {name}={float(value):.6f} step={step}", flush=True)
 
-# Monkey-patch plt.savefig: every save emits an ALFRED_PLOT line so the
-# runner can pick up the file path and emit a plot WS event.
+# Suppress plt.show() — it can clear figures on some matplotlib versions/backends.
+plt.show = lambda *a, **kw: None
+
+# Monkey-patch plt.savefig: flush pending draw calls then save, then emit ALFRED_PLOT.
 _alfred_savefig_orig = plt.savefig
 
 def _alfred_savefig(fname, *args, **kwargs):  # noqa: ANN001
+    plt.draw()  # flush any pending draw calls so the figure isn't blank
     _alfred_savefig_orig(fname, *args, **kwargs)
     print(f"ALFRED_PLOT: {os.path.abspath(str(fname))}", flush=True)
 
@@ -55,6 +58,10 @@ logging.basicConfig(
     stream=sys.stdout,
     force=True,
 )
+# Suppress noisy font-scanner debug logs from matplotlib and PIL
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+logging.getLogger("PIL").setLevel(logging.WARNING)
 
 # ── Phase markers (emit at the START of each phase in generated scripts) ────
 # print("ALFRED_PHASE: preprocess", flush=True)

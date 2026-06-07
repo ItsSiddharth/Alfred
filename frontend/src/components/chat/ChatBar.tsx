@@ -12,7 +12,7 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react'
-import { Send, ChevronDown, AlertCircle, Eye, EyeOff } from 'lucide-react'
+import { Send, ChevronDown, AlertCircle, Eye, EyeOff, StopCircle } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { modelsApi } from '../../api/client'
 import { useStore } from '../../store'
@@ -124,7 +124,14 @@ export function ChatBar() {
     showWorkMode,
     toggleShowWork,
     appendPersistedMessage,
+    progress,
   } = useStore()
+
+  const isRunning = progress.status === 'running' || progress.status === 'waiting'
+
+  const handleStop = () => {
+    window.dispatchEvent(new CustomEvent('alfred:send', { detail: { type: 'stop' } }))
+  }
 
   // Auto-focus chat input when project changes
   useEffect(() => {
@@ -211,6 +218,40 @@ export function ChatBar() {
         >
           <AlertCircle size={11} />
           Select a model below to start chatting.
+        </div>
+      )}
+
+      {/* Generating indicator — visible whenever the backend is active */}
+      {isRunning && (
+        <div
+          className="flex items-center justify-between px-2.5 py-1.5 mb-2 rounded border"
+          style={{
+            backgroundColor: 'rgba(56,189,248,0.05)',
+            borderColor: 'rgba(56,189,248,0.2)',
+          }}
+        >
+          <div className="flex items-center gap-2">
+            <span
+              className="shrink-0 w-1.5 h-1.5 rounded-full"
+              style={{ backgroundColor: 'var(--running)', animation: 'pulse-dot 1.4s ease-in-out infinite' }}
+            />
+            <span className="text-xs font-mono truncate" style={{ color: 'var(--accent)' }}>
+              {progress.label || 'ALFRED is working…'}
+            </span>
+          </div>
+          <button
+            onClick={handleStop}
+            className="shrink-0 flex items-center gap-1 ml-3 px-2 py-0.5 rounded text-xs font-mono transition-colors"
+            style={{
+              color: 'var(--danger)',
+              border: '1px solid rgba(239,68,68,0.35)',
+              backgroundColor: 'rgba(239,68,68,0.06)',
+            }}
+            title="Cancel generation"
+          >
+            <StopCircle size={11} />
+            Stop
+          </button>
         </div>
       )}
 

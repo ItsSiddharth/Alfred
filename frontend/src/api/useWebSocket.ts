@@ -42,6 +42,7 @@ export function useWebSocket(projectId: number | null) {
 
   const {
     setProgress,
+    setPullProgress,
     appendToken,
     finaliseStream,
     resetProgress,
@@ -87,11 +88,7 @@ export function useWebSocket(projectId: number | null) {
           case 'msg_start': {
             const msgId = payload.msg_id as number | undefined
             if (msgId != null) {
-              // Store which DB row the tokens should patch
               setStreamingMsgId(msgId)
-              // Add an empty placeholder to the persisted list so the row
-              // renders immediately and tokens patch it in place.
-              // appendPersistedMessage guards against duplicate IDs.
               appendPersistedMessage({
                 id: msgId,
                 project_id: projectId as number,
@@ -101,23 +98,46 @@ export function useWebSocket(projectId: number | null) {
                 kind: 'chat',
                 metadata_json: '{}',
               })
+              // If no explicit progress event has set us running yet, mark it now
+              // so the ProgressStrip shows active and the Stop button appears.
+              const currentStatus = useStore.getState().progress.status
+              if (currentStatus === 'idle' || currentStatus === 'done') {
+                setProgress({ status: 'running', label: 'Generating response…' })
+              }
             }
             break
           }
 
           // ── Progress ──────────────────────────────────────────────────────
-          case 'progress':
-            setProgress({
-              stage: (payload.stage as number) ?? 1,
-              substage: (payload.substage as string) ?? '',
-              label: (payload.label as string) ?? '',
-              current: (payload.current as number) ?? 0,
-              total: (payload.total as number) ?? 0,
-              status:
-                (payload.status as 'running' | 'waiting' | 'error' | 'done' | 'idle') ??
-                'running',
-            })
+          case 'progress': {
+            const _sub = (payload.substage as string) ?? ''
+            if (_sub === 'pulling') {
+              // Model download — route to pullProgress, not experiment progress
+              const _done = (payload.status as string) === 'done'
+              if (_done) {
+                setPullProgress(null)
+              } else {
+                const _model = (payload.model as string) || [...useStore.getState().pullingModels][0] || ''
+                setPullProgress({
+                  model: _model,
+                  completed: (payload.current as number) ?? 0,
+                  total: (payload.total as number) ?? 0,
+                })
+              }
+            } else {
+              setProgress({
+                stage: (payload.stage as number) ?? 1,
+                substage: _sub,
+                label: (payload.label as string) ?? '',
+                current: (payload.current as number) ?? 0,
+                total: (payload.total as number) ?? 0,
+                status:
+                  (payload.status as 'running' | 'waiting' | 'error' | 'done' | 'idle') ??
+                  'running',
+              })
+            }
             break
+          }
 
           // ── State change ──────────────────────────────────────────────────
           case 'state_change':
@@ -201,6 +221,45 @@ export function useWebSocket(projectId: number | null) {
                   }))
                 })
                 .catch(() => { /* metadata fetch is best-effort */ })
+            }
+            break
+          }
+
+          // ── Stage advance — project moved to next stage ───────────────────
+          case 'stage_advance': {
+            const newStage = payload.new_stage as string
+            // Optimistically update the cached project so the sidebar switches
+            // immediately without waiting for the refetch to complete
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            queryClient.setQueryData(['projects'], (old: any) =>
+              Array.isArray(old)
+                ? old.map((p: any) =>
+                    p.id === projectId ? { ...p, current_stage: newStage } : p
+                  )
+                : old
+            )
+            queryClient.invalidateQueries({ queryKey: ['projects'] })
+            setProgress({ status: 'idle', label: 'Ready', substage: 'idle' })
+            break
+          }
+
+          // ── Stopped — user pressed Stop or task was cancelled ─────────────
+          case 'stopped': {
+            const stoppedMsgId = useStore.getState().streamingMsgId
+            setStreamingMsgId(null)
+            Object.keys(useStore.getState().streamingMessages).forEach((id) => finaliseStream(id))
+            Object.keys(useStore.getState().logEntries).forEach((id) => finaliseLog(id))
+            setApprovalRequest(null)
+            setProgress({ status: 'idle', label: 'Stopped' })
+            if (stoppedMsgId != null) {
+              // Patch the partial message to mark it stopped
+              useStore.setState((state) => ({
+                persistedMessages: state.persistedMessages.map((m) =>
+                  m.id === stoppedMsgId && !m.content.trim()
+                    ? { ...m, content: '*(stopped)*' }
+                    : m
+                ),
+              }))
             }
             break
           }

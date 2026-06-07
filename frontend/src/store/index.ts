@@ -121,6 +121,10 @@ export interface AlfredStore {
   addPullingModel: (tag: string) => void
   removePullingModel: (tag: string) => void
 
+  // Per-model download progress (streamed via WS during pull)
+  pullProgress: { model: string; completed: number; total: number } | null
+  setPullProgress: (p: AlfredStore['pullProgress']) => void
+
   // Progress strip
   progress: ProgressState
   setProgress: (p: Partial<ProgressState>) => void
@@ -265,8 +269,12 @@ export const useStore = create<AlfredStore>((set, get) => ({
     set((state) => {
       const n = new Set(state.pullingModels)
       n.delete(tag)
-      return { pullingModels: n }
+      return { pullingModels: n, pullProgress: null }
     }),
+
+  // ── Pull progress ──────────────────────────────────────────────────────────
+  pullProgress: null,
+  setPullProgress: (p) => set({ pullProgress: p }),
 
   // ── Progress strip ─────────────────────────────────────────────────────────
   progress: defaultProgress,
