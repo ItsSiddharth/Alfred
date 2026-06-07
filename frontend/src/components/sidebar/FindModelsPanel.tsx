@@ -26,6 +26,7 @@ import {
   Loader2,
   Zap,
   HardDrive,
+  X,
 } from 'lucide-react'
 import { modelsApi, type CatalogModel, type LocalModel, type VramFit } from '../../api/client'
 import { useStore } from '../../store'
@@ -448,7 +449,7 @@ function CatalogCard({ model, isInstalled, isPulling, onPull, onSelect }: Catalo
 
 export function FindModelsPanel() {
   const qc = useQueryClient()
-  const { selectedModel, setSelectedModel, pullingModels, addPullingModel, removePullingModel } =
+  const { selectedModel, setSelectedModel, pullingModels, addPullingModel, removePullingModel, setSidebarPanel } =
     useStore()
 
   // Ollama health (poll every 5s so status reflects changes quickly)
@@ -512,9 +513,12 @@ export function FindModelsPanel() {
         style={{ borderColor: 'var(--border)' }}
       >
         <Cpu size={14} style={{ color: 'var(--accent)' }} />
-        <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+        <span className="text-sm font-medium flex-1" style={{ color: 'var(--text-primary)' }}>
           Find models
         </span>
+        <button onClick={() => setSidebarPanel(null)} className="p-1 rounded" style={{ color: 'var(--text-tertiary)' }} title="Close">
+          <X size={13} />
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto py-3">

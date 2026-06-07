@@ -25,7 +25,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
+# Seconds to wait for the very first token before declaring the model frozen
+_FIRST_TOKEN_TIMEOUT = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +176,26 @@ async def delete_model(model_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model keepalive — prevents Ollama from unloading the model during long runs
+# ---------------------------------------------------------------------------
+
+
+async def keepalive_model(model: str, keep_alive: str = "10m") -> None:
+    """
+    Send a no-op generate request to keep the model loaded in Ollama memory.
+    Use keep_alive="10m" to extend the idle timeout.  Silent on failure.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            await client.post(
+                f"{OLLAMA_BASE}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": keep_alive},
+            )
+    except Exception:
+        pass  # keepalive is best-effort
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
@@ -195,6 +217,9 @@ async def stream_chat(
     Returns the complete assistant response as a string.
     Raises OllamaError on failure.
     """
+    import asyncio
+    import json as _json
+
     full_text = ""
     payload: dict = {
         "model": model,
@@ -212,10 +237,10 @@ async def stream_chat(
                 json=payload,
             ) as response:
                 response.raise_for_status()
+                first_token = True
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
-                    import json as _json
                     try:
                         chunk = _json.loads(line)
                     except Exception:
@@ -223,6 +248,7 @@ async def stream_chat(
 
                     token = chunk.get("message", {}).get("content", "")
                     if token:
+                        first_token = False
                         full_text += token
                         if ws_manager and project_id:
                             await ws_manager.broadcast_token(
@@ -239,6 +265,11 @@ async def stream_chat(
     except httpx.HTTPStatusError as exc:
         raise OllamaError(
             f"Ollama returned {exc.response.status_code}. Is the model pulled?"
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise OllamaError(
+            "Ollama stopped responding — the model may have been unloaded. "
+            "Check `ollama ps` and try reloading the model."
         ) from exc
     except Exception as exc:
         raise OllamaError(f"Chat stream failed: {exc}") from exc

@@ -13,7 +13,7 @@ import { create } from 'zustand'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-export type SidebarPanel = 'memory' | 'tools' | 'find-models' | null
+export type SidebarPanel = 'memory' | 'tools' | 'find-models' | 'dashboard' | null
 
 export interface ProgressState {
   stage: number
@@ -71,6 +71,22 @@ export interface ToolCallEvent {
   ts: string
 }
 
+export interface RunLogEntry {
+  id: string        // client-side uuid
+  level: string     // INFO / DEBUG / ERROR / WARNING
+  message: string
+  phase: string     // preprocess / train / eval / error / fix
+  ts: string
+}
+
+export interface PlotEntry {
+  filename: string
+  base64_png: string
+  ascii_art: string
+  experiment_id: number
+  ts: string
+}
+
 // ── Store interface ────────────────────────────────────────────────────────
 
 export interface AlfredStore {
@@ -81,6 +97,10 @@ export interface AlfredStore {
   // Active project
   activeProjectId: number | null
   setActiveProjectId: (id: number | null) => void
+
+  // Active project stage — synced from the project list when a project is selected
+  activeProjectStage: 'hypothesis' | 'setup' | 'run' | null
+  setActiveProjectStage: (stage: 'hypothesis' | 'setup' | 'run' | null) => void
 
   // Active experiment
   activeExperimentId: number | null
@@ -156,6 +176,16 @@ export interface AlfredStore {
   addToolCall: (event: ToolCallEvent) => void
   clearToolCalls: () => void
 
+  // Run stage: live log lines streamed from experiment subprocess
+  runLogs: RunLogEntry[]
+  appendRunLog: (entry: Omit<RunLogEntry, 'id'>) => void
+  clearRunLogs: () => void
+
+  // Run stage: plots emitted during experiment execution
+  activePlots: PlotEntry[]
+  addPlot: (entry: PlotEntry) => void
+  clearPlots: () => void
+
   // Project management helpers
   deleteProjectLocal: (id: number) => void
   /** Reset ALL ephemeral per-project state when switching projects. */
@@ -193,8 +223,13 @@ export const useStore = create<AlfredStore>((set, get) => ({
       streamingMsgId: null,   // F3 fix
       toolCalls: [],
       progress: defaultProgress,
+      runLogs: [],
+      activePlots: [],
     })
   },
+
+  activeProjectStage: null,
+  setActiveProjectStage: (stage) => set({ activeProjectStage: stage }),
 
   activeExperimentId: null,
   setActiveExperimentId: (id) => set({ activeExperimentId: id }),
@@ -349,6 +384,23 @@ export const useStore = create<AlfredStore>((set, get) => ({
     })),
   clearToolCalls: () => set({ toolCalls: [] }),
 
+  // ── Run stage logs ─────────────────────────────────────────────────────────
+  runLogs: [],
+  appendRunLog: (entry) =>
+    set((state) => ({
+      runLogs: [
+        ...state.runLogs,
+        { ...entry, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` },
+      ].slice(-2000),   // cap at 2000 lines to avoid unbounded growth
+    })),
+  clearRunLogs: () => set({ runLogs: [] }),
+
+  // ── Active plots ────────────────────────────────────────────────────────────
+  activePlots: [],
+  addPlot: (entry) =>
+    set((state) => ({ activePlots: [...state.activePlots, entry] })),
+  clearPlots: () => set({ activePlots: [] }),
+
   // ── Project management ─────────────────────────────────────────────────────
   deleteProjectLocal: (id) =>
     set((state) => ({
@@ -364,5 +416,7 @@ export const useStore = create<AlfredStore>((set, get) => ({
       streamingMsgId: null,   // F3 fix — was missing
       toolCalls: [],
       progress: defaultProgress,
+      runLogs: [],
+      activePlots: [],
     }),
 }))

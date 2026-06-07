@@ -3,14 +3,10 @@
  *
  * Driven entirely by the Zustand progress state, which is fed by WS `progress`
  * events. Shows: Stage N / substage name / tqdm-style live bar / label.
- *
- * Colours per C5:
- *   running  → --running  (phosphor green)
- *   waiting  → --warn     (amber)
- *   error    → --danger   (red)
- *   done     → --success  (green)
- *   idle     → --border   (muted)
+ * Also shows an Ollama health dot (polled every 20s).
  */
+import { useQuery } from '@tanstack/react-query'
+import { modelsApi } from '../../api/client'
 import { useStore } from '../../store'
 
 const STAGE_NAMES: Record<number, string> = {
@@ -30,6 +26,14 @@ const STATUS_COLORS: Record<string, string> = {
 export function ProgressStrip() {
   const progress = useStore((s) => s.progress)
   const { stage, substage, label, current, total, status } = progress
+
+  const { data: health } = useQuery({
+    queryKey: ['ollama-health-strip'],
+    queryFn: modelsApi.getHealth,
+    refetchInterval: 20_000,
+    staleTime: 15_000,
+  })
+  const ollamaDown = health != null && !health.available
 
   const isIdle = status === 'idle'
   const pct = total > 0 ? Math.round((current / total) * 100) : 0
@@ -95,6 +99,22 @@ export function ProgressStrip() {
       >
         {isIdle ? 'No active pipeline' : label}
       </span>
+
+      {/* Ollama health dot */}
+      {ollamaDown && (
+        <span
+          className="shrink-0 flex items-center gap-1 text-xs font-mono px-2 py-0.5 rounded border"
+          title="Ollama is not reachable — models cannot run"
+          style={{
+            color: 'var(--danger)',
+            borderColor: 'rgba(239,68,68,0.3)',
+            backgroundColor: 'rgba(239,68,68,0.07)',
+          }}
+        >
+          <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--danger)' }} />
+          Ollama offline
+        </span>
+      )}
     </div>
   )
 }

@@ -51,6 +51,7 @@ export function useWebSocket(projectId: number | null) {
     appendPersistedMessage,
     setStreamingMsgId,
     addToolCall,
+    addPlot,
   } = useStore()
   const queryClient = useQueryClient()
 
@@ -254,6 +255,18 @@ export function useWebSocket(projectId: number | null) {
               label: (payload.message as string) || 'Error',
             })
             break
+
+          // ── Plot ─────────────────────────────────────────────────────────
+          case 'plot': {
+            addPlot({
+              filename: payload.filename as string,
+              base64_png: payload.base64_png as string,
+              ascii_art: payload.ascii_art as string,
+              experiment_id: payload.experiment_id as number,
+              ts,
+            })
+            break
+          }
 
           // ── Result (e.g. model pulled) ────────────────────────────────────
           case 'result':

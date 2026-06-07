@@ -4,7 +4,7 @@
  */
 
 import React from 'react'
-import { BrainCircuit, Wrench, Cpu } from 'lucide-react'
+import { BrainCircuit, Wrench, Cpu, BarChart2 } from 'lucide-react'
 import { type SidebarPanel } from '../../store'
 
 const PANEL_INFO: Record<
@@ -31,6 +31,13 @@ const PANEL_INFO: Record<
     description:
       'Detect your GPU VRAM, browse research-friendly Ollama models, see VRAM fit estimates, and pull models with live progress.',
     stage: 'Stage 1',
+  },
+  dashboard: {
+    icon: <BarChart2 size={20} />,
+    title: 'Dashboard',
+    description:
+      'Compare experiment iterations side by side: metric charts overlaid across runs, runtime table, compute budget estimate, and one-click paper export.',
+    stage: 'Stage 8',
   },
 }
 

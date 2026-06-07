@@ -4,7 +4,7 @@
  */
 
 import { useEffect, useState } from 'react'
-import { Wrench, RefreshCw, ChevronDown, ChevronRight, Play, ToggleLeft, ToggleRight, Loader2 } from 'lucide-react'
+import { Wrench, RefreshCw, ChevronDown, ChevronRight, Play, ToggleLeft, ToggleRight, Loader2, X } from 'lucide-react'
 import { useStore } from '../../store'
 
 // ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ function RecentCalls({ projectId }: { projectId: number }) {
 export function ToolsPanel() {
   const [tools, setTools] = useState<ToolInfo[]>([])
   const [loading, setLoading] = useState(true)
-  const { activeProjectId } = useStore()
+  const { activeProjectId, setSidebarPanel } = useStore()
 
   const loadTools = async () => {
     setLoading(true)
@@ -215,9 +215,12 @@ export function ToolsPanel() {
     <div className="flex flex-col h-full overflow-hidden">
       <div className="flex items-center gap-2 px-4 py-3 border-b shrink-0" style={{ borderColor: 'var(--border)' }}>
         <Wrench size={14} style={{ color: 'var(--accent)' }} />
-        <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>Tools</span>
-        <button onClick={loadTools} className="ml-auto" style={{ color: 'var(--text-tertiary)' }}>
+        <span className="text-sm font-medium flex-1" style={{ color: 'var(--text-primary)' }}>Tools</span>
+        <button onClick={loadTools} className="p-1 rounded" style={{ color: 'var(--text-tertiary)' }} title="Refresh">
           <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+        </button>
+        <button onClick={() => setSidebarPanel(null)} className="p-1 rounded" style={{ color: 'var(--text-tertiary)' }} title="Close">
+          <X size={13} />
         </button>
       </div>
 

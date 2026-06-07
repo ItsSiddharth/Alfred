@@ -11,8 +11,8 @@
  *   assistant message metadata_json (rendered by ChatThread/ShowWorkMeta).
  */
 
-import React, { useState, useRef } from 'react'
-import { Send, ChevronDown, AlertCircle, Eye, EyeOff, FlaskConical } from 'lucide-react'
+import React, { useState, useRef, useEffect } from 'react'
+import { Send, ChevronDown, AlertCircle, Eye, EyeOff } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { modelsApi } from '../../api/client'
 import { useStore } from '../../store'
@@ -120,10 +120,18 @@ export function ChatBar() {
     selectedModel,
     setSelectedModel,
     activeProjectId,
+    activeProjectStage,
     showWorkMode,
     toggleShowWork,
     appendPersistedMessage,
   } = useStore()
+
+  // Auto-focus chat input when project changes
+  useEffect(() => {
+    if (activeProjectId && selectedModel) {
+      textareaRef.current?.focus()
+    }
+  }, [activeProjectId, selectedModel])
 
   const { data: localData } = useQuery({
     queryKey: ['local-models'],
@@ -177,15 +185,6 @@ export function ChatBar() {
     }
   }
 
-  const handleDemoPipeline = () => {
-    if (!activeProjectId) return
-    window.dispatchEvent(
-      new CustomEvent('alfred:send', {
-        detail: { type: 'demo_pipeline', project_id: activeProjectId },
-      })
-    )
-  }
-
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setValue(e.target.value)
     const el = e.target
@@ -231,6 +230,8 @@ export function ChatBar() {
               ? 'Select a project to start chatting.'
               : !selectedModel
               ? 'Select a model below first…'
+              : activeProjectStage === 'run'
+              ? 'Discuss results, brainstorm ideas, or say "run the experiment"…'
               : 'Describe your research hypothesis…'
           }
           disabled={!activeProjectId}
@@ -294,22 +295,6 @@ export function ChatBar() {
           Show work
         </button>
 
-        {/* Demo pipeline — dev/QA convenience */}
-        {activeProjectId && (
-          <button
-            onClick={handleDemoPipeline}
-            className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors"
-            title="Trigger the demo pipeline to test the state machine UI"
-            style={{
-              color: 'var(--text-tertiary)',
-              borderColor: 'var(--border)',
-              backgroundColor: 'transparent',
-            }}
-          >
-            <FlaskConical size={11} />
-            Demo
-          </button>
-        )}
       </div>
     </div>
   )

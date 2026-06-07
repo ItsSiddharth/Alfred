@@ -10,10 +10,10 @@
  * Everything else is UNCHANGED from Stage 3.
  */
 
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import {
   BrainCircuit, Wrench, Cpu, Plus, FolderOpen,
-  ChevronRight, Zap, ZapOff, Trash2, Loader2,
+  ChevronRight, Zap, ZapOff, Trash2, Loader2, BarChart2, X,
 } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { projectsApi, messagesApi, type Project } from '../../api/client'
@@ -22,6 +22,9 @@ import { Button } from '../common/Button'
 import { FindModelsPanel } from './FindModelsPanel'
 import { MemoryPanel } from './MemoryPanel'
 import { ToolsPanel } from './ToolsPanel'   // ← Stage 4
+import { DashboardPanel } from '../experiment/DashboardPanel'             // ← Stage 8
+import { ProjectBindingPanel } from '../experiment/ProjectBindingPanel'  // ← Stage 7
+import { GitHistoryPanel } from '../experiment/GitHistoryPanel'           // ← Stage 7.5
 
 // ── Panel nav item ─────────────────────────────────────────────────────────
 
@@ -38,6 +41,7 @@ function NavItem({ icon, label, panel }: NavItemProps) {
     <button
       onClick={() => setSidebarPanel(panel)}
       className="w-full flex items-center gap-2.5 px-3 py-2 rounded text-sm transition-colors duration-100"
+      title={active ? `Close ${label}` : `Open ${label}`}
       style={{
         backgroundColor: active ? 'var(--bg-elevated)' : 'transparent',
         color: active ? 'var(--accent)' : 'var(--text-secondary)',
@@ -45,8 +49,11 @@ function NavItem({ icon, label, panel }: NavItemProps) {
       }}
     >
       {icon}
-      <span className="truncate">{label}</span>
-      {active && <ChevronRight size={12} className="ml-auto shrink-0" />}
+      <span className="truncate flex-1 text-left">{label}</span>
+      {active
+        ? <X size={12} className="ml-auto shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+        : <ChevronRight size={12} className="ml-auto shrink-0" style={{ opacity: 0.4 }} />
+      }
     </button>
   )
 }
@@ -58,12 +65,15 @@ function PanelDrawer({ panel }: { panel: SidebarPanel }) {
   const renderContent = () => {
     if (panel === 'find-models') return <FindModelsPanel />
     if (panel === 'memory') return <MemoryPanel />
-    if (panel === 'tools') return <ToolsPanel />    // ← Stage 4: real panel
+    if (panel === 'tools') return <ToolsPanel />
+    if (panel === 'dashboard') return <DashboardPanel />   // ← Stage 8
     return null
   }
+  // Dashboard needs extra width for charts
+  const width = panel === 'dashboard' ? '400px' : '300px'
   return (
     <div className="flex flex-col h-full shrink-0"
-      style={{ width: '300px', backgroundColor: 'var(--bg-surface)', borderRight: '1px solid var(--border)' }}>
+      style={{ width, backgroundColor: 'var(--bg-surface)', borderRight: '1px solid var(--border)' }}>
       {renderContent()}
     </div>
   )
@@ -82,6 +92,11 @@ function AutoApproveToggle({ project }: { project: Project }) {
       onClick={() => mutation.mutate(!project.auto_approve)}
       disabled={mutation.isPending}
       className="flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded border transition-colors disabled:opacity-40"
+      title={
+        project.auto_approve
+          ? 'Quick mode ON — ALFRED skips clarifying questions and auto-approves plans. Click to switch to Manual.'
+          : 'Manual mode — ALFRED asks questions and waits for your approval. Click to enable Quick mode.'
+      }
       style={{
         color: project.auto_approve ? 'var(--warn)' : 'var(--text-tertiary)',
         borderColor: project.auto_approve ? 'rgba(245,158,11,0.4)' : 'var(--border)',
@@ -89,7 +104,7 @@ function AutoApproveToggle({ project }: { project: Project }) {
       }}
     >
       {project.auto_approve ? <Zap size={10} /> : <ZapOff size={10} />}
-      {project.auto_approve ? 'Auto' : 'Manual'}
+      {project.auto_approve ? 'Quick' : 'Manual'}
     </button>
   )
 }
@@ -148,8 +163,16 @@ function ProjectItem({ project, isActive, onSelect, onDelete, isDeleting }: Proj
       </div>
 
       {isActive && (
-        <div className="flex justify-end px-3 pb-2">
-          <AutoApproveToggle project={project} />
+        <div className="px-3 pb-2">
+          <div className="flex justify-end mb-1">
+            <AutoApproveToggle project={project} />
+          </div>
+          {project.current_stage === 'run' && (
+            <>
+              <ProjectBindingPanel project={project} />
+              <GitHistoryPanel project={project} />
+            </>
+          )}
         </div>
       )}
     </div>
@@ -189,7 +212,7 @@ function NewProjectForm({ onDone, onCreated }: { onDone: () => void; onCreated: 
 export function Sidebar() {
   const {
     activeProjectId, setActiveProjectId, setPersistedMessages,
-    sidebarPanel, clearProjectState,
+    sidebarPanel, clearProjectState, setActiveProjectStage,
   } = useStore()
   const [showNewForm, setShowNewForm] = useState(false)
   const [deletingId, setDeletingId] = useState<number | null>(null)
@@ -200,10 +223,19 @@ export function Sidebar() {
     queryFn: projectsApi.list,
   })
 
+  // Sync activeProjectStage whenever the projects list refreshes or active project changes.
+  // Must be in useEffect — never call store setters inside useQuery select (render-phase side-effect).
+  useEffect(() => {
+    if (activeProjectId == null) return
+    const active = projects.find((p) => p.id === activeProjectId)
+    if (active) setActiveProjectStage(active.current_stage)
+  }, [projects, activeProjectId, setActiveProjectStage])
+
   const handleSelectProject = async (project: Project) => {
     if (project.id === activeProjectId) return
-    clearProjectState()           // ← Stage 4: clear ephemeral state
+    clearProjectState()
     setActiveProjectId(project.id)
+    setActiveProjectStage(project.current_stage)
     try {
       const msgs = await messagesApi.list(project.id, 200)
       setPersistedMessages(msgs)
@@ -247,6 +279,7 @@ export function Sidebar() {
           <NavItem icon={<BrainCircuit size={15} />} label="Memory" panel="memory" />
           <NavItem icon={<Wrench size={15} />} label="Tools" panel="tools" />
           <NavItem icon={<Cpu size={15} />} label="Find models" panel="find-models" />
+          <NavItem icon={<BarChart2 size={15} />} label="Dashboard" panel="dashboard" />
         </nav>
 
         <div className="mx-3 border-t" style={{ borderColor: 'var(--border)' }} />

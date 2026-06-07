@@ -26,11 +26,13 @@ import {
   ChevronRight,
   ExternalLink,
   RefreshCw,
+  Clock,
 } from 'lucide-react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { experimentsApi, hypothesisApi } from '../../api/client'
+import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query'
+import { experimentsApi, hypothesisApi, dashboardApi } from '../../api/client'
 import { useStore, type ApprovalRequest } from '../../store'
 import { Button } from '../common/Button'
+import { DiffView } from './DiffView'
 
 // ---------------------------------------------------------------------------
 // Citations list — reused inside each ScoreMeter
@@ -342,6 +344,7 @@ export function ApprovalCard({ request }: ApprovalCardProps) {
   // Determine which plan view to render
   const isScorecard =
     'novelty_score' in plan || 'gap_score' in plan || 'publishability_score' in plan
+  const isDiffPlan = 'diff' in plan && typeof plan.diff === 'string'
 
   // Approve mutation
   const approveMutation = useMutation({
@@ -394,6 +397,13 @@ export function ApprovalCard({ request }: ApprovalCardProps) {
 
   const substageLabel = substage.replace(/_/g, ' ')
 
+  // Stage 2: fetch compute estimate to show on plan card
+  const computeEstimate = useQuery({
+    queryKey: ['compute-estimate', activeProjectId],
+    queryFn: () => dashboardApi.getComputeEstimate(activeProjectId!),
+    enabled: activeProjectId != null && stage === 2,
+  })
+
   return (
     <div
       className="rounded border overflow-hidden"
@@ -431,6 +441,33 @@ export function ApprovalCard({ request }: ApprovalCardProps) {
           >
             Stage {stage} · {substageLabel}
           </span>
+          {isDiffPlan && (plan.iteration as number) > 0 && (
+            <span
+              className="text-xs font-mono px-1.5 py-0.5 rounded"
+              style={{
+                backgroundColor: 'rgba(99,102,241,0.12)',
+                color: 'var(--accent)',
+                border: '1px solid rgba(99,102,241,0.25)',
+              }}
+            >
+              iter {plan.iteration as number}
+            </span>
+          )}
+          {/* Compute estimate badge — Stage 2 plan cards */}
+          {stage === 2 && computeEstimate.data?.estimated_seconds != null && (
+            <span
+              className="flex items-center gap-1 text-xs font-mono px-1.5 py-0.5 rounded"
+              style={{
+                backgroundColor: 'var(--bg-inset)',
+                color: 'var(--text-tertiary)',
+                border: '1px solid var(--border)',
+              }}
+              title={computeEstimate.data.note}
+            >
+              <Clock size={9} />
+              {computeEstimate.data.estimated_label}
+            </span>
+          )}
         </div>
 
         {/* Show-work: edit button always accessible */}
@@ -459,6 +496,30 @@ export function ApprovalCard({ request }: ApprovalCardProps) {
             editedPlan={editedPlan}
             onEditChange={handleEditChange}
           />
+        ) : isDiffPlan ? (
+          <div className="space-y-3">
+            {/* Summary + code path */}
+            {(plan.summary as string | undefined) && (
+              <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                {plan.summary as string}
+              </p>
+            )}
+            {(plan.code_path as string | undefined) && (
+              <div
+                className="text-xs font-mono px-2 py-1.5 rounded"
+                style={{
+                  backgroundColor: 'var(--bg-inset)',
+                  color: 'var(--text-tertiary)',
+                  border: '1px solid var(--border)',
+                  wordBreak: 'break-all',
+                }}
+              >
+                {plan.code_path as string}
+              </div>
+            )}
+            {/* Diff viewer */}
+            <DiffView diff={plan.diff as string} />
+          </div>
         ) : (
           <GenericPlanView
             plan={plan}

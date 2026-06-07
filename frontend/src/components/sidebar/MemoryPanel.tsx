@@ -635,6 +635,7 @@ function ItemsList({ projectId }: ItemsListProps) {
 export function MemoryPanel() {
   const activeProjectId = useStore((s) => s.activeProjectId)
   const selectedModel = useStore((s) => s.selectedModel)
+  const setSidebarPanel = useStore((s) => s.setSidebarPanel)
   const [showAddForm, setShowAddForm] = useState(false)
 
   if (!activeProjectId) {
@@ -645,9 +646,12 @@ export function MemoryPanel() {
           style={{ borderColor: 'var(--border)' }}
         >
           <BrainCircuit size={14} style={{ color: 'var(--accent)' }} />
-          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+          <span className="text-sm font-medium flex-1" style={{ color: 'var(--text-primary)' }}>
             Memory
           </span>
+          <button onClick={() => setSidebarPanel(null)} className="p-1 rounded" style={{ color: 'var(--text-tertiary)' }} title="Close">
+            <X size={13} />
+          </button>
         </div>
         <div className="flex-1 flex items-center justify-center p-6 text-center">
           <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
@@ -666,12 +670,12 @@ export function MemoryPanel() {
         style={{ borderColor: 'var(--border)' }}
       >
         <BrainCircuit size={14} style={{ color: 'var(--accent)' }} />
-        <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+        <span className="text-sm font-medium flex-1" style={{ color: 'var(--text-primary)' }}>
           Memory
         </span>
         <button
           onClick={() => setShowAddForm((v) => !v)}
-          className="ml-auto flex items-center gap-1 text-xs px-2 py-1 rounded border transition-colors"
+          className="flex items-center gap-1 text-xs px-2 py-1 rounded border transition-colors"
           style={{
             color: showAddForm ? 'var(--accent)' : 'var(--text-tertiary)',
             borderColor: showAddForm ? 'rgba(56,189,248,0.4)' : 'var(--border)',
@@ -681,6 +685,9 @@ export function MemoryPanel() {
         >
           <Plus size={11} />
           Add
+        </button>
+        <button onClick={() => setSidebarPanel(null)} className="p-1 rounded" style={{ color: 'var(--text-tertiary)' }} title="Close">
+          <X size={13} />
         </button>
       </div>
 

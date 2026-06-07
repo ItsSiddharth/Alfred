@@ -18,7 +18,7 @@ from sqlmodel import Session, select
 
 from alfred.db import get_session
 from alfred.models.db_models import (
-    Experiment, MemoryItem, Message, Project, ProjectStage, Score, ToolCall,
+    Experiment, ExperimentStatus, MemoryItem, Message, Project, ProjectStage, Score, ToolCall,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,61 @@ async def delete_project(
     session.add(project)
     session.commit()
     logger.info("Project deleted: id=%s", project_id)
+
+
+@router.post("/{project_id}/skip-hypothesis")
+async def skip_hypothesis(
+    project_id: int,
+    session: Session = Depends(get_session),
+) -> dict:
+    """
+    Skip hypothesis validation and advance the project directly to experiment setup.
+    Creates an iteration-1 experiment record if one doesn't exist yet.
+    """
+    project = session.get(Project, project_id)
+    if project is None or project.status == "deleted":
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.current_stage != ProjectStage.hypothesis:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Project is in stage '{project.current_stage}', not 'hypothesis'.",
+        )
+
+    project.current_stage = ProjectStage.setup
+    project.updated_at = datetime.utcnow()
+    session.add(project)
+
+    # Create iteration-1 experiment if absent
+    existing = session.exec(
+        select(Experiment).where(
+            Experiment.project_id == project_id,
+            Experiment.iteration == 1,
+        )
+    ).first()
+    if existing is None:
+        exp = Experiment(
+            project_id=project_id,
+            iteration=1,
+            seed=42,
+            plan_json="{}",
+            status=ExperimentStatus.planned,
+        )
+        session.add(exp)
+
+    session.commit()
+
+    # Broadcast a WS message so the chat shows the stage transition
+    try:
+        from alfred.ws import manager
+        import asyncio
+        asyncio.create_task(manager.send(
+            str(project_id), "log",
+            {"message": "Skipped hypothesis research — entering experiment design.", "phase": "setup"},
+        ))
+    except Exception:
+        pass
+
+    return {"status": "ok", "current_stage": "setup", "project_id": project_id}
 
 
 @router.post("/{project_id}/auto_approve")

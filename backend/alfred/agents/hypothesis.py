@@ -42,7 +42,7 @@ from alfred.tools.base import ToolRegistry
 logger = logging.getLogger(__name__)
 
 # ── Tuning constants ─────────────────────────────────────────────────────────
-MAX_QUERIES = 5
+MAX_QUERIES = 1          # default; overridden by config.research_num_queries
 SWEEP_PER_QUERY = 12     # results per source per query
 SNOWBALL_TOP_K = 10      # papers to expand
 FUZZY_THRESHOLD = 0.85   # title dedup threshold
@@ -142,11 +142,13 @@ class HypothesisAgent:
 
     # ── Public entry point ────────────────────────────────────────────────────
 
-    async def run(self, hypothesis: str, feedback: str = "") -> None:
+    async def run(self, hypothesis: str, feedback: str = "", num_queries: int = 0) -> None:
         """
         Run (or re-run) the full validation loop.
         Pass *feedback* from a previous rejection to refine query generation.
+        Pass *num_queries* to override the config default (0 = use config value).
         """
+        self._num_queries = num_queries if num_queries > 0 else self._resolve_num_queries()
         exp_id = self._get_or_create_experiment()
         register_machine(self.project_id, self.machine)
 
@@ -252,6 +254,14 @@ class HypothesisAgent:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _resolve_num_queries() -> int:
+        try:
+            from alfred.config import get_config
+            return max(1, get_config().research_num_queries)
+        except Exception:
+            return MAX_QUERIES
+
     async def _log(self, msg: str) -> None:
         await self.ws.send(self.pid_str, "log", {
             "message": msg, "phase": "hypothesis"
@@ -316,6 +326,7 @@ class HypothesisAgent:
     # ── Phase A — query generation ────────────────────────────────────────────
 
     async def _phase_a(self, hypothesis: str, feedback: str = "") -> list[str]:
+        n = getattr(self, "_num_queries", MAX_QUERIES)
         feedback_section = ""
         if feedback:
             feedback_section = (
@@ -323,17 +334,22 @@ class HypothesisAgent:
                 "Adjust your queries to address this feedback."
             )
 
+        angle_lines = [
+            "1. Core method / technique name",
+            "2. Problem domain and application area",
+            "3. 'Related prior work' framing (what already exists)",
+            "4. Alternative terminology or phrasing",
+            "5. 'What would make this already solved?' framing",
+        ]
+        angles_section = "\n".join(angle_lines[:n])
+
+        example = '["query 1"]' if n == 1 else '["query 1", "query 2"]'
         prompt = (
-            f"Generate exactly {MAX_QUERIES} diverse search queries for this ML research hypothesis.\n\n"
+            f"Generate exactly {n} diverse search quer{'y' if n == 1 else 'ies'} for this ML research hypothesis.\n\n"
             f"Hypothesis: {hypothesis}{feedback_section}\n\n"
-            "Query angles (one per angle):\n"
-            "1. Core method / technique name\n"
-            "2. Problem domain and application area\n"
-            "3. 'Related prior work' framing (what already exists)\n"
-            "4. Alternative terminology or phrasing\n"
-            "5. 'What would make this already solved?' framing\n\n"
-            f"Return ONLY a JSON array of {MAX_QUERIES} query strings. No markdown, no explanation.\n"
-            'Example: ["query 1", "query 2", "query 3", "query 4", "query 5"]'
+            f"Query angle{'s' if n > 1 else ''} (one per angle):\n{angles_section}\n\n"
+            f"Return ONLY a JSON array of {n} query string{'s' if n > 1 else ''}. No markdown, no explanation.\n"
+            f"Example: {example}"
         )
 
         raw = await self.client.chat_raw(
@@ -347,18 +363,19 @@ class HypothesisAgent:
             clean = _strip_fences(raw)
             result = json.loads(clean)
             if isinstance(result, list):
-                return [str(q) for q in result[:MAX_QUERIES] if q]
+                return [str(q) for q in result[:n] if q]
         except Exception:
             pass
 
-        # Graceful fallback
-        return [
+        # Graceful fallback — return up to n queries
+        fallbacks = [
             hypothesis[:200],
             f"{hypothesis[:100]} deep learning",
             f"{hypothesis[:100]} survey review",
             f"{hypothesis[:100]} benchmark comparison",
             f"{hypothesis[:100]} state of the art",
         ]
+        return fallbacks[:n]
 
     # ── Phase B — broad sweep ─────────────────────────────────────────────────
 

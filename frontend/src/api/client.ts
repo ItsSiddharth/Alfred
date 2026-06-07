@@ -108,6 +108,12 @@ export const projectsApi = {
       `/api/projects/${id}/auto_approve`,
       { method: 'POST', body: JSON.stringify({ auto_approve }) }
     ),
+
+  skipHypothesis: (id: number) =>
+    apiFetch<{ status: string; current_stage: string; project_id: number }>(
+      `/api/projects/${id}/skip-hypothesis`,
+      { method: 'POST' }
+    ),
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +291,143 @@ export const hypothesisApi = {
         body: JSON.stringify({ hypothesis, model, feedback }),
       }
     ),
+}
+
+// ---------------------------------------------------------------------------
+// Runner API (Stage 7)
+// ---------------------------------------------------------------------------
+
+export interface RunnerStatus {
+  current_stage: string
+  current_substage: string
+  active_experiment_id: number | null
+  status: string
+}
+
+export interface GitLogEntry {
+  hash: string
+  short_hash: string
+  message: string
+  date: string
+}
+
+export interface MetricPoint {
+  step: number
+  value: number
+}
+
+export interface MetricCurve {
+  name: string
+  points: MetricPoint[]
+}
+
+export interface RunSummary {
+  id: number
+  iteration: number
+  status: string
+  started_at: string | null
+  finished_at: string | null
+  runtime_seconds: number | null
+  git_commit: string
+  version_mode: string
+  code_path: string
+}
+
+export interface RunLogLine {
+  id: number
+  level: string
+  message: string
+  created_at: string
+  phase: string
+}
+
+export const runnerApi = {
+  bind: (projectId: number, conda_env: string, experiment_folder: string) =>
+    apiFetch<{ id: number; conda_env: string; experiment_folder: string; status: string }>(
+      `/api/projects/${projectId}/bind`,
+      { method: 'PATCH', body: JSON.stringify({ conda_env, experiment_folder }) }
+    ),
+
+  status: (projectId: number) =>
+    apiFetch<RunnerStatus>(`/api/projects/${projectId}/runner/status`),
+
+  gitLog: (projectId: number) =>
+    apiFetch<GitLogEntry[]>(`/api/projects/${projectId}/runner/git/log`),
+
+  rollback: (projectId: number, commit_hash: string) =>
+    apiFetch<{ status: string; commit_hash: string }>(
+      `/api/projects/${projectId}/runner/git/rollback`,
+      { method: 'POST', body: JSON.stringify({ commit_hash }) }
+    ),
+
+  listRuns: (projectId: number) =>
+    apiFetch<RunSummary[]>(`/api/projects/${projectId}/runner/runs`),
+
+  getMetrics: (projectId: number, expId: number) =>
+    apiFetch<MetricCurve[]>(`/api/projects/${projectId}/runner/runs/${expId}/metrics`),
+
+  getLogs: (projectId: number, expId: number) =>
+    apiFetch<RunLogLine[]>(`/api/projects/${projectId}/runner/runs/${expId}/logs`),
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard API (Stage 8)
+// ---------------------------------------------------------------------------
+
+export interface DashboardMetricPoint {
+  step: number
+  value: number
+}
+
+export interface DashboardMetricCurve {
+  name: string
+  experiment_id: number
+  iteration: number
+  points: DashboardMetricPoint[]
+}
+
+export interface DashboardExperimentRow {
+  id: number
+  iteration: number
+  status: string
+  runtime_seconds: number | null
+  git_commit: string
+  version_mode: string
+  metrics_summary: Record<string, number>
+  plan_summary: string
+}
+
+export interface DashboardResponse {
+  experiments: DashboardExperimentRow[]
+  metric_curves: DashboardMetricCurve[]
+  metric_names: string[]
+}
+
+export interface ComputeEstimateResponse {
+  estimated_seconds: number | null
+  estimated_label: string
+  based_on_n_runs: number
+  note: string
+}
+
+export interface ExportResponse {
+  markdown: string
+  latex: string
+  filename: string
+}
+
+export const dashboardApi = {
+  getDashboard: (projectId: number) =>
+    apiFetch<DashboardResponse>(`/api/projects/${projectId}/dashboard`),
+
+  getComputeEstimate: (projectId: number) =>
+    apiFetch<ComputeEstimateResponse>(`/api/projects/${projectId}/compute-estimate`),
+
+  export: (projectId: number, include_latex = true, iterations?: number[]) =>
+    apiFetch<ExportResponse>(`/api/projects/${projectId}/export`, {
+      method: 'POST',
+      body: JSON.stringify({ include_latex, iterations: iterations ?? null }),
+    }),
 }
 
 // ---------------------------------------------------------------------------

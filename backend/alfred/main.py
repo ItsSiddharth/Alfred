@@ -27,8 +27,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from alfred.api.config_router import router as config_router
+from alfred.api.dashboard_router import router as dashboard_router       # ← Stage 8
 from alfred.api.experiments_router import router as experiments_router
 from alfred.api.hypothesis_router import router as hypothesis_router   # ← Stage 5
+from alfred.api.runner_router import router as runner_router             # ← Stage 7
 from alfred.api.memory_router import global_router as memory_global_router
 from alfred.api.memory_router import project_router as memory_project_router
 from alfred.api.messages_router import router as messages_router
@@ -61,6 +63,18 @@ Your job:
    literature validation pipeline. Only do this when you genuinely have enough context.
 4. Never include [START_RESEARCH] on the very first message — always ask at least one
    clarifying question first.
+"""
+
+_HYPOTHESIS_PREAMBLE_QUICK = """\
+
+You are ALFRED in Quick Mode — the user wants fast iteration with minimal back-and-forth.
+
+Your job:
+1. Acknowledge the hypothesis briefly (1-2 sentences) and confirm what you understood.
+2. Immediately emit [START_RESEARCH] on its own line to trigger the literature review.
+3. Do NOT ask clarifying questions unless the hypothesis is so vague that research is impossible.
+
+Quick Mode: assume the user knows what they want. Start research now.
 """
 
 
@@ -111,7 +125,7 @@ def _load_tools() -> None:
 
 app = FastAPI(
     title="ALFRED Research Agent",
-    version="0.5.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 
@@ -132,6 +146,8 @@ app.include_router(memory_project_router)
 app.include_router(memory_global_router)
 app.include_router(tools_router)
 app.include_router(hypothesis_router)         # ← Stage 5
+app.include_router(runner_router)             # ← Stage 7
+app.include_router(dashboard_router)          # ← Stage 8
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +239,10 @@ async def _handle_chat(project_id: str, msg: dict) -> None:  # noqa: C901
         asyncio.create_task(
             _handle_chat_setup(project_id, pid_int, model, content, message_id, project)
         )
+    elif stage == ProjectStage.run:
+        asyncio.create_task(
+            _handle_chat_run(project_id, pid_int, model, content, message_id, project)
+        )
     else:
         await _handle_chat_plain(project_id, msg, pid_int, model, content, message_id)
 
@@ -298,7 +318,10 @@ async def _handle_chat_hypothesis(
             "msg_id": asst_msg_id, "message_id": message_id,
         })
 
-    # Stream clarifying-questions response
+    # Stream clarifying-questions response (quick mode skips clarification)
+    hypothesis_preamble = (
+        _HYPOTHESIS_PREAMBLE_QUICK if project.auto_approve else _HYPOTHESIS_PREAMBLE
+    )
     client = make_client(model, project_id=project_id, ws_manager=manager)
     full_response = ""
     try:
@@ -306,7 +329,7 @@ async def _handle_chat_hypothesis(
             Role.RESEARCHER,
             [{"role": "user", "content": content}],
             message_id=message_id,
-            extra_system=(extra_system + "\n\n" + _HYPOTHESIS_PREAMBLE).strip(),
+            extra_system=(extra_system + "\n\n" + hypothesis_preamble).strip(),
         )
     except OllamaError as exc:
         full_response = f"⚠️ {exc}"
@@ -540,6 +563,8 @@ async def _create_setup_approval(
     """Transition state machine to AWAITING_APPROVAL with the setup plan."""
     from alfred.agents.setup import SetupAgent
     from alfred.db import get_engine
+    from alfred.memory.context import build_memory_block
+    from alfred.models.db_models import Message, MessageKind, MessageRole
     from alfred.state_machine.machine import S2Sub
     from sqlmodel import Session
 
@@ -554,6 +579,7 @@ async def _create_setup_approval(
                 auto_approve=auto_approve,
             )
             machine = agent._get_machine()
+            machine._db = session  # keep machine's DB ref in sync with the live session
 
             # Attach experiment ID to plan
             exp_id = agent._get_or_create_experiment()
@@ -569,14 +595,83 @@ async def _create_setup_approval(
                 final_plan = response.edited_plan if response.edited_plan else plan
                 await agent.handle_approved_plan(final_plan)
             elif response:
-                # Rejected — user continues chatting to refine the plan
+                # Rejected — immediately refine the plan and open a new approval card
+                feedback = response.feedback or ""
                 await machine.transition(
                     S2Sub.REFINING, label="Refining plan based on feedback"
                 )
+
+                # Emit the feedback as a Show Work log entry (visible when Show Work is on)
                 await manager.send(project_id, "log", {
-                    "message": f"Plan rejected. Feedback: {response.feedback or '(none)'}",
+                    "message": f"[Refinement] User feedback: {feedback or '(no feedback provided)'}",
                     "phase": "setup",
                 })
+
+                # Persist the rejection feedback as a user message so history carries it
+                feedback_content = (
+                    f"Revise the plan based on this feedback: {feedback}"
+                    if feedback else "Please revise the plan."
+                )
+                feedback_msg = Message(
+                    project_id=pid_int, role=MessageRole.user,
+                    content=feedback_content, kind=MessageKind.chat, metadata_json="{}",
+                )
+                session.add(feedback_msg)
+                session.commit()
+
+                # Create an assistant placeholder so the refinement streams into chat
+                asst_row = Message(
+                    project_id=pid_int, role=MessageRole.assistant,
+                    content="", kind=MessageKind.chat, metadata_json="{}",
+                )
+                session.add(asst_row)
+                session.commit()
+                session.refresh(asst_row)
+                asst_msg_id: int = asst_row.id
+
+                await manager.send(project_id, "msg_start", {
+                    "msg_id": asst_msg_id, "message_id": str(asst_msg_id),
+                })
+
+                memory_block = ""
+                try:
+                    memory_block = build_memory_block(session, pid_int)
+                except Exception:
+                    pass
+
+                # Stream the LLM's refinement — tokens appear in chat
+                full_response, new_plan = await agent.generate_turn(
+                    user_message=feedback_content,
+                    asst_msg_id=asst_msg_id,
+                    memory_block=memory_block,
+                )
+
+                # Persist the refinement response
+                row = session.get(Message, asst_msg_id)
+                if row:
+                    row.content = full_response
+                    row.metadata_json = json.dumps({
+                        "model": model, "memory_tokens": 0,
+                        "memory_block": "", "tool_calls": [],
+                    })
+                    session.add(row)
+                    session.commit()
+
+                await manager.send(project_id, "done", {
+                    "msg_id": asst_msg_id, "summary": "Plan refined"
+                })
+
+                # If a refined plan emerged, open a fresh approval gate
+                if new_plan is not None:
+                    await _create_setup_approval(project_id, pid_int, model, new_plan, auto_approve)
+                else:
+                    await manager.send(project_id, "log", {
+                        "message": (
+                            "Plan needs more information — keep chatting and "
+                            "ALFRED will propose a revised plan when ready."
+                        ),
+                        "phase": "setup",
+                    })
     except Exception as exc:
         logger.exception("Setup approval flow failed: %s", exc)
         await manager.broadcast_error(
@@ -584,6 +679,426 @@ async def _create_setup_approval(
             human_message=f"Setup approval failed: {exc}",
             remediation="Check the backend terminal.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Run stage — Stage-3 agent: Run & Iterate (Stage 7)
+# ---------------------------------------------------------------------------
+
+# Keywords that signal the user wants to execute code / start a run
+_RUN_INTENT_KEYWORDS = frozenset({
+    "run the experiment", "run experiment", "run it", "run this",
+    "start the experiment", "start experiment", "execute", "begin training",
+    "kick off", "launch", "start training", "let's run", "lets run",
+    "go ahead and run", "fire it up", "run the code", "run code",
+    "generate the code", "generate code", "write the code", "write code",
+    "start the run", "begin the run",
+    # "build" variants — user says "build this" / "let's build" / "build it"
+    "build the experiment", "build it", "build this", "build the code",
+    "let's build", "lets build", "start building", "begin building",
+    # "proceed" / "go" variants
+    "let's go", "lets go", "let's proceed", "lets proceed", "go ahead",
+    "proceed", "let's start", "lets start",
+})
+
+
+def _is_run_intent(content: str) -> bool:
+    """True if the message is most likely asking to execute an experiment."""
+    lower = content.lower().strip()
+    for phrase in _RUN_INTENT_KEYWORDS:
+        if phrase in lower:
+            return True
+    # Short imperative-style messages that are just "run" / "go" / "build" etc.
+    words = lower.split()
+    if len(words) <= 3 and words and words[0] in {
+        "run", "go", "train", "execute", "start", "begin", "fire", "build", "proceed"
+    }:
+        return True
+    return False
+
+
+async def _handle_chat_run(
+    project_id: str,
+    pid_int: int,
+    model: str,
+    content: str,
+    message_id: str,
+    project: "Project",
+) -> None:
+    """
+    Route chat in the 'run' stage:
+      - RUN intent  → RunnerAgent pipeline
+      - DISCUSS intent → free-form research discussion with full experiment context
+    """
+    from alfred.db import get_engine
+    from alfred.models.db_models import Message, MessageKind, MessageRole
+    from alfred.state_machine.machine import get_machine, S3Sub
+    from sqlmodel import Session
+
+    engine = get_engine()
+
+    # Guard: project must be bound before running (but NOT before discussing)
+    machine = get_machine(pid_int)
+    experiment_running = (
+        machine is not None
+        and getattr(machine, "current_substage", None) not in (S3Sub.AWAITING_NEXT, None)
+    )
+
+    run_intent = _is_run_intent(content)
+
+    if run_intent and (not project.conda_env or not project.experiment_folder):
+        await manager.send(project_id, "log", {
+            "message": (
+                "⚠️  Project not bound. "
+                "Set the conda environment and experiment folder in the sidebar before running."
+            ),
+            "phase": "run",
+        })
+        await manager.broadcast_error(
+            project_id,
+            human_message="Project not bound to a conda env / experiment folder.",
+            remediation="Open the sidebar, fill in Conda env and Experiment folder, then save.",
+        )
+        return
+
+    # Persist user message
+    asst_msg_id: int | None = None
+    with Session(engine) as session:
+        try:
+            user_row = Message(
+                project_id=pid_int, role=MessageRole.user,
+                content=content, kind=MessageKind.chat, metadata_json="{}",
+            )
+            session.add(user_row)
+            session.commit()
+        except Exception as exc:
+            logger.warning("Could not persist user message (run stage): %s", exc)
+
+        try:
+            asst_row = Message(
+                project_id=pid_int, role=MessageRole.assistant,
+                content="", kind=MessageKind.chat, metadata_json="{}",
+            )
+            session.add(asst_row)
+            session.commit()
+            session.refresh(asst_row)
+            asst_msg_id = asst_row.id
+        except Exception as exc:
+            logger.warning("Could not create assistant placeholder (run stage): %s", exc)
+
+    if asst_msg_id is not None:
+        await manager.send(project_id, "msg_start", {
+            "msg_id": asst_msg_id, "message_id": message_id,
+        })
+
+    # Route: DISCUSS if experiment running or no run intent
+    if experiment_running:
+        await _research_discussion(
+            project_id, pid_int, model, content, message_id, asst_msg_id, project,
+            hint="An experiment is currently running — ALFRED will discuss while it proceeds.",
+        )
+        return
+
+    if not run_intent:
+        await _research_discussion(
+            project_id, pid_int, model, content, message_id, asst_msg_id, project,
+        )
+        return
+
+    # RUN intent — delegate to RunnerAgent
+    try:
+        from alfred.agents.runner import RunnerAgent  # noqa: PLC0415
+        from alfred.db import get_engine  # noqa: PLC0415
+        from sqlmodel import Session  # noqa: PLC0415
+
+        with Session(get_engine()) as session:
+            agent = RunnerAgent(
+                project_id=pid_int,
+                model=model,
+                ws_manager=manager,
+                db_session=session,
+                auto_approve=project.auto_approve,
+            )
+            await agent.run(content, asst_msg_id=asst_msg_id)
+    except ImportError:
+        placeholder = (
+            "✓ Project is bound. "
+            f"conda env: `{project.conda_env}` | "
+            f"folder: `{project.experiment_folder}`\n\n"
+            "The experiment runner (Stage 7.2) is not yet built."
+        )
+        if asst_msg_id is not None:
+            with Session(engine) as session:
+                row = session.get(Message, asst_msg_id)
+                if row:
+                    row.content = placeholder
+                    session.add(row)
+                    session.commit()
+            await manager.send(project_id, "token", {
+                "token": placeholder, "msg_id": asst_msg_id,
+            })
+        await manager.send(project_id, "done", {
+            "msg_id": asst_msg_id, "summary": "Ready",
+        })
+    except Exception as exc:
+        logger.exception("RunnerAgent failed: %s", exc)
+        await manager.broadcast_error(
+            project_id,
+            human_message=f"Runner error: {exc}",
+            remediation="Check the backend terminal for the full traceback.",
+        )
+        await manager.send(project_id, "done", {"msg_id": asst_msg_id})
+
+
+# ---------------------------------------------------------------------------
+# Free-form research discussion — collaborative brainstorming in run stage
+# ---------------------------------------------------------------------------
+
+async def _research_discussion(
+    project_id: str,
+    pid_int: int,
+    model: str,
+    content: str,
+    message_id: str,
+    asst_msg_id: int | None,
+    project: "Project",
+    hint: str = "",
+) -> None:
+    """
+    Respond as a senior research collaborator with full context about what
+    has been run, what the results are, and what the current plan is.
+
+    Context injected into the system prompt:
+      - Project name + stage
+      - Last completed experiment: plan summary, final metrics, git commit
+      - ALFRED's last interpretation message (if any)
+      - Memory block
+      - Recent conversation history (last 12 messages)
+    """
+    from alfred.agents.base import Role, make_client
+    from alfred.db import get_engine
+    from alfred.memory.context import build_memory_block
+    from alfred.models.db_models import (
+        Experiment, ExperimentStatus, Message, MessageKind,
+        MessageRole, Metric,
+    )
+    from alfred.services.ollama import OllamaError
+    from sqlmodel import Session, select
+
+    engine = get_engine()
+    extra_system = ""
+    history: list[dict] = []
+    full_response = ""
+
+    with Session(engine) as session:
+        # Memory block
+        try:
+            extra_system = build_memory_block(session, pid_int)
+        except Exception:
+            pass
+
+        # Build experiment context string
+        exp_context = _build_experiment_context(session, pid_int)
+
+        # Load recent conversation history (last 12 messages, excluding the
+        # current turn which isn't committed yet)
+        try:
+            rows = session.exec(
+                select(Message)
+                .where(Message.project_id == pid_int)
+                .where(Message.kind == MessageKind.chat)
+                .order_by(Message.created_at.desc())  # type: ignore[arg-type]
+            ).all()
+            for row in reversed(rows[-13:-1]):  # last 12 before current
+                history.append({
+                    "role": row.role.value,
+                    "content": row.content[:800] if row.content else "",
+                })
+        except Exception as exc:
+            logger.debug("Could not load history for discussion: %s", exc)
+
+    # Build the research collaborator system prompt
+    hint_section = f"\n\nNote: {hint}" if hint else ""
+
+    not_bound = not project.conda_env or not project.experiment_folder
+    binding_section = ""
+    if not_bound:
+        binding_section = (
+            "\n\nCRITICAL — PROJECT NOT BOUND: This project has no conda environment "
+            "or experiment folder configured. You MUST NOT fabricate, estimate, or speculate "
+            "about actual experiment results, metrics, or training behaviour. "
+            "If the user asks to run, build, or execute an experiment in any way, "
+            "respond with: 'Before running, please set up the conda environment and "
+            "experiment folder in the sidebar (click the project name to expand the "
+            "binding panel). I cannot run experiments until the environment is configured.' "
+            "Do not suggest workarounds or hypothetical outcomes."
+        )
+
+    research_system = f"""\
+You are ALFRED — a proactive local AI research agent with full context about this project's \
+experiments and results. You are the researcher's intelligent partner, not just a responder.
+
+PROJECT: {project.name}
+STAGE: Run & Iterate{hint_section}{binding_section}
+
+{exp_context}
+
+Your behaviour:
+- Lead with the most relevant insight or recommendation first (bottom line up front).
+- Be decisive: when you have enough context, make a specific recommendation rather than listing options.
+- Proactively flag issues (overfit, unstable training, poor baseline) without being asked.
+- When the user asks "what should I do next?", give ONE concrete answer with reasoning.
+- Discuss with scientific rigour but keep responses tight — no padding.
+- If the user asks to run an experiment, acknowledge and route it (they say "run" or "execute").
+
+To run an experiment: user says "run" / "run the experiment" / "execute" — \
+you do not need to prompt them for this.
+"""
+
+    full_system = (research_system + "\n\n" + extra_system).strip()
+
+    # Append the current message to history
+    history.append({"role": "user", "content": content})
+
+    client = make_client(model, project_id=project_id, ws_manager=manager)
+    try:
+        full_response = await client.chat(
+            Role.COLLABORATOR,
+            history,
+            message_id=message_id,
+            extra_system=full_system,
+        )
+    except OllamaError as exc:
+        full_response = f"⚠️ {exc}"
+        await manager.broadcast_error(
+            project_id, human_message=str(exc),
+            remediation="Ensure Ollama is running and the selected model is pulled."
+        )
+    except Exception as exc:
+        full_response = f"⚠️ {exc}"
+        await manager.broadcast_error(project_id, human_message=str(exc))
+
+    # Persist the response
+    if asst_msg_id is not None:
+        try:
+            with Session(engine) as session:
+                row = session.get(Message, asst_msg_id)
+                if row:
+                    row.content = full_response
+                    row.metadata_json = json.dumps({
+                        "model": model,
+                        "memory_tokens": len(extra_system) // 4,
+                        "memory_block": extra_system,
+                        "tool_calls": [],
+                        "mode": "discussion",
+                    })
+                    session.add(row)
+                    session.commit()
+        except Exception as exc:
+            logger.warning("Could not persist discussion response: %s", exc)
+
+    await manager.send(project_id, "done", {
+        "msg_id": asst_msg_id, "summary": "Discussion complete",
+    })
+
+
+def _build_experiment_context(session: "Session", pid_int: int) -> str:
+    """
+    Build a compact natural-language summary of the most recent completed
+    experiment for injection into the discussion system prompt.
+    """
+    from alfred.models.db_models import Experiment, ExperimentStatus, Message, MessageKind, MessageRole, Metric
+    from sqlmodel import select
+
+    lines: list[str] = []
+
+    try:
+        # Most recent completed experiment
+        exp = session.exec(
+            select(Experiment)
+            .where(Experiment.project_id == pid_int)
+            .where(Experiment.status == ExperimentStatus.done)
+            .order_by(Experiment.iteration.desc())  # type: ignore[arg-type]
+        ).first()
+
+        if exp is None:
+            # Check if there's a planned experiment (not yet run)
+            planned = session.exec(
+                select(Experiment)
+                .where(Experiment.project_id == pid_int)
+                .order_by(Experiment.iteration.desc())  # type: ignore[arg-type]
+            ).first()
+            if planned:
+                lines.append(f"CURRENT PLAN (Iteration {planned.iteration}, not yet run):")
+                try:
+                    plan = json.loads(planned.plan_json)
+                    for k, v in plan.items():
+                        if k not in ("experiment_id", "kind") and v:
+                            lines.append(f"  {k}: {str(v)[:200]}")
+                except Exception:
+                    pass
+            else:
+                lines.append("No experiments have been run yet.")
+            return "\n".join(lines)
+
+        lines.append(f"LAST COMPLETED EXPERIMENT (Iteration {exp.iteration}):")
+        try:
+            plan = json.loads(exp.plan_json)
+            for k in ("objective", "architecture", "dataset", "metrics"):
+                v = plan.get(k)
+                if v:
+                    lines.append(f"  {k.title()}: {str(v)[:200]}")
+        except Exception:
+            pass
+
+        if exp.runtime_seconds:
+            lines.append(f"  Runtime: {exp.runtime_seconds:.1f}s")
+        if exp.git_commit:
+            lines.append(f"  Git commit: {exp.git_commit[:7]}")
+
+        # Final metric values
+        metrics = session.exec(
+            select(Metric)
+            .where(Metric.experiment_id == exp.id)
+            .order_by(Metric.name.asc(), Metric.step.desc())  # type: ignore[arg-type]
+        ).all()
+
+        seen_names: set[str] = set()
+        metric_lines: list[str] = []
+        for m in metrics:
+            if m.name not in seen_names:
+                seen_names.add(m.name)
+                metric_lines.append(f"  {m.name}: {m.value:.4f} (step {m.step})")
+        if metric_lines:
+            lines.append("  Final metrics:")
+            lines.extend(metric_lines[:8])
+
+        # ALFRED's last interpretation (most recent assistant message in run stage)
+        last_interp = session.exec(
+            select(Message)
+            .where(Message.project_id == pid_int)
+            .where(Message.role == MessageRole.assistant)
+            .where(Message.kind == MessageKind.chat)
+            .order_by(Message.created_at.desc())  # type: ignore[arg-type]
+        ).first()
+        if last_interp and last_interp.content:
+            snippet = last_interp.content[:600].replace("\n", " ")
+            lines.append(f"\nALFRED'S LAST ANALYSIS: {snippet}{'…' if len(last_interp.content) > 600 else ''}")
+
+        # All iterations summary (if multiple)
+        all_done = session.exec(
+            select(Experiment)
+            .where(Experiment.project_id == pid_int)
+            .where(Experiment.status == ExperimentStatus.done)
+            .order_by(Experiment.iteration.asc())  # type: ignore[arg-type]
+        ).all()
+        if len(all_done) > 1:
+            lines.append(f"\nALL COMPLETED ITERATIONS: {len(all_done)} total (iterations {', '.join(str(e.iteration) for e in all_done)})")
+
+    except Exception as exc:
+        logger.debug("Could not build experiment context: %s", exc)
+
+    return "\n".join(lines) if lines else "No experiment context available yet."
 
 
 # ---------------------------------------------------------------------------

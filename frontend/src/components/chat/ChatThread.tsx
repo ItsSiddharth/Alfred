@@ -32,7 +32,7 @@
  *   "Approved — pipeline continuing" state to the card.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -50,11 +50,16 @@ import {
   Globe,
   BookOpen,
   FileText,
+  GitBranch,
+  Pencil,
+  FlaskConical,
+  Activity,
 } from 'lucide-react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useStore, type PersistedMessage, type ToolCallEvent } from '../../store'
-import { experimentsApi } from '../../api/client'
+import { experimentsApi, projectsApi } from '../../api/client'
 import type { ApprovalRequest } from '../../store'
+import { PlotsRow } from './PlotView'
 import 'highlight.js/styles/github-dark.css'
 
 // ---------------------------------------------------------------------------
@@ -378,6 +383,118 @@ function ShowWorkFeed() {
 
 
 // ---------------------------------------------------------------------------
+// WorkingIndicator — shows when ALFRED is active but not streaming tokens
+// ---------------------------------------------------------------------------
+
+function WorkingIndicator() {
+  const progress = useStore((s) => s.progress)
+  const streamingMsgId = useStore((s) => s.streamingMsgId)
+  const logEntries = useStore((s) => s.logEntries)
+
+  const isActive = progress.status === 'running' || progress.status === 'waiting'
+  const isStreaming = streamingMsgId !== null
+  const hasActiveLogs = Object.values(logEntries).some((e) => e.isStreaming)
+
+  // Only show when the backend is working but nothing is visibly streaming
+  if (!isActive || isStreaming || hasActiveLogs) return null
+
+  const label = progress.label || progress.substage || 'Working…'
+
+  return (
+    <div className="flex items-start gap-3 px-4 py-2">
+      <div
+        className="shrink-0 w-7 h-7 rounded flex items-center justify-center mt-0.5"
+        style={{ backgroundColor: 'var(--bg-elevated)', border: '1px solid var(--border)' }}
+      >
+        <Bot size={13} style={{ color: 'var(--accent)' }} />
+      </div>
+      <div
+        className="rounded px-3 py-2 flex items-center gap-3"
+        style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border)' }}
+      >
+        {/* Staggered pulsing dots */}
+        <div className="flex gap-1">
+          <span className="w-1.5 h-1.5 rounded-full"
+            style={{ backgroundColor: 'var(--accent)', animation: 'pulse-dot 1.4s ease-in-out 0ms infinite' }} />
+          <span className="w-1.5 h-1.5 rounded-full"
+            style={{ backgroundColor: 'var(--accent)', animation: 'pulse-dot 1.4s ease-in-out 280ms infinite' }} />
+          <span className="w-1.5 h-1.5 rounded-full"
+            style={{ backgroundColor: 'var(--accent)', animation: 'pulse-dot 1.4s ease-in-out 560ms infinite' }} />
+        </div>
+        <span className="text-xs font-mono" style={{ color: 'var(--text-secondary)' }}>
+          {label}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// ResearchLogFeed — collapsable live log entries (non-thinking)
+// ---------------------------------------------------------------------------
+
+function ResearchLogFeed() {
+  const logEntries = useStore((s) => s.logEntries)
+  const [expanded, setExpanded] = useState(true)
+  const bodyRef = useRef<HTMLDivElement>(null)
+
+  const logValues = Object.values(logEntries).filter((e) => e.kind === 'log')
+  const isAnyStreaming = logValues.some((e) => e.isStreaming)
+
+  // Auto-collapse 2s after streaming stops
+  useEffect(() => {
+    if (!isAnyStreaming && logValues.length > 0) {
+      const t = setTimeout(() => setExpanded(false), 2000)
+      return () => clearTimeout(t)
+    }
+  }, [isAnyStreaming]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-expand when streaming resumes
+  useEffect(() => {
+    if (isAnyStreaming) setExpanded(true)
+  }, [isAnyStreaming])
+
+  // Auto-scroll body on new lines
+  useEffect(() => {
+    if (expanded && bodyRef.current) {
+      bodyRef.current.scrollTop = bodyRef.current.scrollHeight
+    }
+  }, [logValues.length, expanded])
+
+  if (logValues.length === 0) return null
+
+  return (
+    <div className="mx-4 my-1 rounded border overflow-hidden"
+      style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-surface)' }}>
+      <button onClick={() => setExpanded((e) => !e)}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-left border-b"
+        style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-elevated)' }}>
+        <Activity size={11} style={{ color: isAnyStreaming ? 'var(--info)' : 'var(--text-tertiary)' }} />
+        <span className="flex-1 text-xs font-mono" style={{ color: 'var(--text-secondary)' }}>
+          Research logs · {logValues.length} entr{logValues.length !== 1 ? 'ies' : 'y'}
+          {isAnyStreaming && <span className="ml-1" style={{ color: 'var(--info)' }}>— live</span>}
+        </span>
+        <span style={{ color: 'var(--text-tertiary)' }}>
+          {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+        </span>
+      </button>
+      {expanded && (
+        <div ref={bodyRef} className="max-h-52 overflow-y-auto px-3 py-2 space-y-0.5">
+          {logValues.map((entry) => (
+            <div key={entry.messageId} className="flex items-start gap-2 text-xs font-mono py-0.5">
+              <span className="shrink-0 mt-0.5" style={{ color: 'var(--accent)' }}>›</span>
+              <span style={{ color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {entry.content}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // ChatBubble — Fix 1: plain text during streaming, markdown after
 // ---------------------------------------------------------------------------
 
@@ -493,7 +610,107 @@ function ErrorBubble({ content }: { content: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// NextIterCard — plan body for kind === "next_iteration"
+// ---------------------------------------------------------------------------
+
+function NextIterCard({
+  plan,
+  versionMode,
+  onVersionModeChange,
+}: {
+  plan: Record<string, unknown>
+  versionMode: 'modify' | 'branch'
+  onVersionModeChange: (vm: 'modify' | 'branch') => void
+}) {
+  const changes = plan.changes as string[] | undefined
+  const rationale = plan.rationale as string | undefined
+  const iteration = plan.iteration as number | undefined
+
+  return (
+    <div className="space-y-2">
+      {/* Iteration badge + subtitle */}
+      <div className="flex items-center gap-2">
+        <span
+          className="text-xs font-mono px-1.5 py-0.5 rounded"
+          style={{ backgroundColor: 'var(--bg-inset)', color: 'var(--accent)', border: '1px solid var(--border)' }}
+        >
+          iter {iteration}
+        </span>
+        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+          Proposed changes from previous run
+        </span>
+      </div>
+
+      {/* Changes list */}
+      {changes && changes.length > 0 && (
+        <div
+          className="px-3 py-2 rounded border text-xs space-y-1"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}
+        >
+          {changes.map((c, i) => (
+            <div key={i} className="flex gap-1.5">
+              <span style={{ color: 'var(--running)' }}>+</span>
+              <span style={{ color: 'var(--text-secondary)' }}>{c}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Rationale */}
+      {rationale && (
+        <div
+          className="text-xs px-3 py-2 rounded border italic"
+          style={{
+            borderColor: 'var(--border)',
+            backgroundColor: 'var(--bg-inset)',
+            color: 'var(--text-tertiary)',
+            lineHeight: '1.6',
+          }}
+        >
+          {rationale}
+        </div>
+      )}
+
+      {/* Version mode selector */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-mono" style={{ color: 'var(--text-tertiary)' }}>
+          version mode
+        </span>
+        <button
+          onClick={() => onVersionModeChange('modify')}
+          className="flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono transition-colors"
+          style={{
+            backgroundColor: versionMode === 'modify' ? 'var(--bg-elevated)' : 'transparent',
+            color: versionMode === 'modify' ? 'var(--accent)' : 'var(--text-tertiary)',
+            border: `1px solid ${versionMode === 'modify' ? 'var(--accent)' : 'var(--border)'}`,
+          }}
+        >
+          <Pencil size={9} />
+          modify
+        </button>
+        <button
+          onClick={() => onVersionModeChange('branch')}
+          className="flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono transition-colors"
+          style={{
+            backgroundColor: versionMode === 'branch' ? 'var(--bg-elevated)' : 'transparent',
+            color: versionMode === 'branch' ? 'var(--accent)' : 'var(--text-tertiary)',
+            border: `1px solid ${versionMode === 'branch' ? 'var(--accent)' : 'var(--border)'}`,
+          }}
+        >
+          <GitBranch size={9} />
+          branch
+        </button>
+        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+          {versionMode === 'branch' ? '— new subfolder' : '— edit in place'}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // InlineApprovalCard — Fix 3: visible feedback on approve/reject
+//                      7.5 addition: next_iteration plan rendering + version mode
 // ---------------------------------------------------------------------------
 
 function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
@@ -504,6 +721,14 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
   const [approvedState, setApprovedState] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
+  const plan = request.plan
+  const isNextIter = plan.kind === 'next_iteration'
+
+  // Version mode state for next_iteration cards (user can toggle before approving)
+  const [versionMode, setVersionMode] = useState<'modify' | 'branch'>(
+    (plan.version_mode as string) === 'branch' ? 'branch' : 'modify'
+  )
+
   // Fix 3: read experiment_id from top-level OR from inside plan
   const expId = request.experiment_id ?? (request.plan?.experiment_id as number | undefined) ?? 0
 
@@ -511,7 +736,9 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
     mutationFn: () => {
       if (!activeProjectId) throw new Error('No active project')
       if (expId === 0) throw new Error('No experiment ID — is the demo pipeline running?')
-      return experimentsApi.approve(activeProjectId, expId)
+      // For next_iteration cards, pass the (possibly updated) version_mode back
+      const editedPlan = isNextIter ? { version_mode: versionMode } : undefined
+      return experimentsApi.approve(activeProjectId, expId, editedPlan)
     },
     onSuccess: () => {
       setApprovedState(true)
@@ -540,8 +767,7 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
 
   const isAutoApprove = request.auto_approve
 
-  // Scores from plan
-  const plan = request.plan
+  // Scores from plan (hypothesis validator)
   const hasScores = 'novelty_score' in plan || 'gap_score' in plan
   const scores: Array<{ label: string; value: number }> = hasScores ? [
     { label: 'Novelty', value: (plan.novelty_score as number) ?? 0 },
@@ -549,13 +775,19 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
     { label: 'Publishability', value: (plan.publishability_score as number) ?? 0 },
   ] : []
 
+  // Fields to suppress from generic key-value display
+  const HIDDEN_KEYS = new Set([
+    'experiment_id', 'auto_approve', 'stage', 'substage',
+    'kind', 'iteration', 'changes', 'rationale', 'version_mode',
+  ])
+
   if (approvedState) {
     return (
       <div className="rounded border px-4 py-3 flex items-center gap-2"
         style={{ backgroundColor: 'rgba(52,211,153,0.07)', borderColor: 'rgba(52,211,153,0.3)' }}>
         <CheckCircle2 size={14} style={{ color: 'var(--running)' }} />
         <span className="text-sm" style={{ color: 'var(--running)' }}>
-          Approved — pipeline continuing…
+          {isNextIter ? 'Approved — generating next iteration…' : 'Approved — pipeline continuing…'}
         </span>
       </div>
     )
@@ -573,57 +805,76 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
           borderColor: 'var(--border)',
           backgroundColor: isAutoApprove ? 'rgba(245,158,11,0.06)' : 'var(--bg-elevated)',
         }}>
-        <AlertTriangle size={13} style={{ color: isAutoApprove ? 'var(--warn)' : 'var(--accent)' }} />
+        {isNextIter
+          ? <GitBranch size={13} style={{ color: 'var(--accent)' }} />
+          : <AlertTriangle size={13} style={{ color: isAutoApprove ? 'var(--warn)' : 'var(--accent)' }} />
+        }
         <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
-          {isAutoApprove ? 'Auto-approved' : 'Review & approve'}
+          {isNextIter
+            ? `Iteration ${plan.iteration as number} proposal`
+            : isAutoApprove ? 'Auto-approved' : 'Review & approve'
+          }
         </span>
         <span className="text-xs font-mono px-1.5 py-0.5 rounded ml-auto"
           style={{ backgroundColor: 'var(--bg-inset)', color: 'var(--text-tertiary)', border: '1px solid var(--border)' }}>
-          Stage {request.stage} · {request.substage.replace(/_/g, ' ')}
+          {isNextIter
+            ? `awaiting_next`
+            : `Stage ${request.stage} · ${request.substage.replace(/_/g, ' ')}`
+          }
         </span>
       </div>
 
       {/* Plan content */}
       <div className="p-4 space-y-2">
-        {/* Score meters */}
-        {scores.map(({ label, value }) => {
-          if (value == null) return null
-          const color = value >= 65 ? 'var(--running)' : value >= 40 ? 'var(--warn)' : 'var(--danger)'
-          return (
-            <div key={label} className="flex items-center gap-3">
-              <span className="text-xs font-mono w-24 shrink-0" style={{ color: 'var(--text-tertiary)' }}>
-                {label}
-              </span>
-              <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-elevated)' }}>
-                <div className="h-full rounded-full" style={{ width: `${value}%`, backgroundColor: color }} />
+        {isNextIter ? (
+          <NextIterCard
+            plan={plan}
+            versionMode={versionMode}
+            onVersionModeChange={setVersionMode}
+          />
+        ) : (
+          <>
+            {/* Score meters */}
+            {scores.map(({ label, value }) => {
+              if (value == null) return null
+              const color = value >= 65 ? 'var(--running)' : value >= 40 ? 'var(--warn)' : 'var(--danger)'
+              return (
+                <div key={label} className="flex items-center gap-3">
+                  <span className="text-xs font-mono w-24 shrink-0" style={{ color: 'var(--text-tertiary)' }}>
+                    {label}
+                  </span>
+                  <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-elevated)' }}>
+                    <div className="h-full rounded-full" style={{ width: `${value}%`, backgroundColor: color }} />
+                  </div>
+                  <span className="text-sm font-mono w-8 text-right shrink-0" style={{ color }}>{value}</span>
+                </div>
+              )
+            })}
+
+            {/* Rationale */}
+            {(plan.rationale as string | undefined) && (
+              <div className="text-xs px-3 py-2 rounded border"
+                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)', color: 'var(--text-secondary)', lineHeight: '1.6' }}>
+                {plan.rationale as string}
               </div>
-              <span className="text-sm font-mono w-8 text-right shrink-0" style={{ color }}>{value}</span>
-            </div>
-          )
-        })}
+            )}
 
-        {/* Rationale */}
-        {(plan.rationale as string | undefined) && (
-          <div className="text-xs px-3 py-2 rounded border"
-            style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)', color: 'var(--text-secondary)', lineHeight: '1.6' }}>
-            {plan.rationale as string}
-          </div>
+            {/* Generic key-value for non-scorecard plans */}
+            {!hasScores && Object.entries(plan)
+              .filter(([k]) => !HIDDEN_KEYS.has(k))
+              .map(([key, val]) => (
+                <div key={key} className="flex gap-3 px-3 py-2 rounded border text-xs"
+                  style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}>
+                  <span className="font-mono w-32 shrink-0" style={{ color: 'var(--text-tertiary)' }}>
+                    {key.replace(/_/g, ' ')}
+                  </span>
+                  <span className="font-mono flex-1 break-words" style={{ color: 'var(--text-primary)' }}>
+                    {typeof val === 'object' ? JSON.stringify(val) : String(val ?? '')}
+                  </span>
+                </div>
+              ))}
+          </>
         )}
-
-        {/* Generic key-value for non-scorecard plans */}
-        {!hasScores && Object.entries(plan)
-          .filter(([k]) => !['experiment_id', 'auto_approve', 'stage', 'substage'].includes(k))
-          .map(([key, val]) => (
-            <div key={key} className="flex gap-3 px-3 py-2 rounded border text-xs"
-              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-inset)' }}>
-              <span className="font-mono w-32 shrink-0" style={{ color: 'var(--text-tertiary)' }}>
-                {key.replace(/_/g, ' ')}
-              </span>
-              <span className="font-mono flex-1 break-words" style={{ color: 'var(--text-primary)' }}>
-                {typeof val === 'object' ? JSON.stringify(val) : String(val ?? '')}
-              </span>
-            </div>
-          ))}
       </div>
 
       {/* Error message */}
@@ -661,14 +912,14 @@ function InlineApprovalCard({ request }: { request: ApprovalRequest }) {
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium disabled:opacity-40 transition-colors"
                 style={{ backgroundColor: 'var(--accent)', color: 'var(--bg-base)', border: '1px solid var(--accent)' }}>
                 <CheckCircle2 size={12} />
-                {approveMutation.isPending ? 'Approving…' : 'Approve'}
+                {approveMutation.isPending ? 'Approving…' : isNextIter ? 'Run next iteration' : 'Approve'}
               </button>
               <button
                 onClick={() => setRejectMode(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors"
                 style={{ backgroundColor: 'transparent', color: 'var(--danger)', border: '1px solid var(--danger)' }}>
                 <XCircle size={12} />
-                Reject
+                {isNextIter ? 'Stop here' : 'Reject'}
               </button>
             </>
           ) : (
@@ -728,10 +979,67 @@ function PersistedMessageRow({ message, isStreaming }: { message: PersistedMessa
 }
 
 // ---------------------------------------------------------------------------
+// Skip hypothesis action — shown when project is in hypothesis stage with no messages
+// ---------------------------------------------------------------------------
+
+function SkipHypothesisAction() {
+  const activeProjectId = useStore((s) => s.activeProjectId)
+  const setActiveProjectStage = useStore((s) => s.setActiveProjectStage)
+  const queryClient = useQueryClient()
+  const [done, setDone] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const mutation = useMutation({
+    mutationFn: () => projectsApi.skipHypothesis(activeProjectId!),
+    onSuccess: () => {
+      setDone(true)
+      setActiveProjectStage('setup')
+      queryClient.invalidateQueries({ queryKey: ['projects'] })
+    },
+    onError: (e: Error) => setErr(e.message),
+  })
+
+  if (done) {
+    return (
+      <div className="flex items-center gap-2 px-4 py-2 rounded border text-xs"
+        style={{ borderColor: 'rgba(52,211,153,0.3)', backgroundColor: 'rgba(52,211,153,0.07)', color: 'var(--running)' }}>
+        <CheckCircle2 size={11} />
+        Skipped to experiment design — describe what you'd like to build.
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col items-center gap-2">
+      <button
+        onClick={() => mutation.mutate()}
+        disabled={mutation.isPending}
+        className="flex items-center gap-2 px-4 py-2 rounded border text-sm transition-colors disabled:opacity-40"
+        style={{
+          borderColor: 'var(--border)',
+          backgroundColor: 'var(--bg-elevated)',
+          color: 'var(--text-secondary)',
+        }}
+      >
+        <FlaskConical size={13} style={{ color: 'var(--accent)' }} />
+        {mutation.isPending ? 'Skipping…' : 'Skip research → Jump to experiment design'}
+      </button>
+      <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+        or send a message to start the literature review first
+      </span>
+      {err && <span className="text-xs" style={{ color: 'var(--danger)' }}>{err}</span>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Empty state
 // ---------------------------------------------------------------------------
 
 function EmptyState() {
+  const activeProjectId = useStore((s) => s.activeProjectId)
+  const activeProjectStage = useStore((s) => s.activeProjectStage)
+
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-4 select-none">
       <div className="w-12 h-12 rounded-xl flex items-center justify-center"
@@ -743,9 +1051,15 @@ function EmptyState() {
           ALFRED is ready
         </div>
         <div className="text-sm" style={{ color: 'var(--text-tertiary)' }}>
-          Select or create a project, then describe your research hypothesis.
+          {activeProjectId
+            ? 'Describe your research hypothesis to start the literature review.'
+            : 'Select or create a project, then describe your research hypothesis.'}
         </div>
       </div>
+      {/* Skip button — only shown when in hypothesis stage */}
+      {activeProjectId && activeProjectStage === 'hypothesis' && (
+        <SkipHypothesisAction />
+      )}
     </div>
   )
 }
@@ -761,13 +1075,17 @@ export function ChatThread() {
   const logEntries = useStore((s) => s.logEntries)
   const approvalRequest = useStore((s) => s.approvalRequest)
   const activeProjectId = useStore((s) => s.activeProjectId)
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const activeProjectStage = useStore((s) => s.activeProjectStage)
+  const activePlots = useStore((s) => s.activePlots)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const userScrolledUp = useRef(false)
 
   const persistedIds = new Set(persistedMessages.map((m) => m.id))
   const orphanStreamEntries = Object.values(streamingMessages).filter(
     (s) => !persistedIds.has(parseInt(s.messageId, 10))
   )
   const logValues = Object.values(logEntries)
+  const thinkingEntries = logValues.filter((e) => e.kind === 'thinking')
 
   const hasContent =
     persistedMessages.length > 0 ||
@@ -775,8 +1093,19 @@ export function ChatThread() {
     logValues.length > 0 ||
     approvalRequest !== null
 
+  // Track whether user has scrolled away from the bottom
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    userScrolledUp.current = el.scrollHeight - el.scrollTop - el.clientHeight > 80
+  }, [])
+
+  // Scroll to bottom on new content — instant to avoid competing smooth-scroll animations
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (userScrolledUp.current) return
+    const el = scrollContainerRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
   }, [persistedMessages, streamingMessages, logEntries, approvalRequest])
 
   if (!activeProjectId) {
@@ -788,7 +1117,12 @@ export function ChatThread() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto flex flex-col" style={{ backgroundColor: 'var(--bg-base)' }}>
+    <div
+      ref={scrollContainerRef}
+      onScroll={handleScroll}
+      className="flex-1 overflow-y-auto flex flex-col"
+      style={{ backgroundColor: 'var(--bg-base)' }}
+    >
       {!hasContent ? (
         <EmptyState />
       ) : (
@@ -803,26 +1137,15 @@ export function ChatThread() {
             />
           ))}
 
-          {/* Live thinking / log entries */}
-          {logValues.map((entry) => {
-            if (entry.kind === 'thinking') {
-              return (
-                <div key={entry.messageId} className="px-4 py-2">
-                  <ThinkingTab content={entry.content} isStreaming={entry.isStreaming} title="Thinking" defaultExpanded />
-                </div>
-              )
-            }
-            // Log entries (research phase messages)
-            return (
-              <div key={entry.messageId} className="px-4 py-0.5">
-                <div className="flex items-start gap-2 text-xs font-mono px-2 py-1"
-                  style={{ color: 'var(--text-tertiary)' }}>
-                  <span className="shrink-0 mt-0.5" style={{ color: 'var(--accent)' }}>›</span>
-                  <span style={{ color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap' }}>{entry.content}</span>
-                </div>
-              </div>
-            )
-          })}
+          {/* Live thinking entries (collapsable tab, already styled) */}
+          {thinkingEntries.map((entry) => (
+            <div key={entry.messageId} className="px-4 py-2">
+              <ThinkingTab content={entry.content} isStreaming={entry.isStreaming} title="Thinking" defaultExpanded />
+            </div>
+          ))}
+
+          {/* Research log entries — grouped in a collapsable feed */}
+          <ResearchLogFeed />
 
           {/* Show Work: inline tool call feed */}
           <ShowWorkFeed />
@@ -841,15 +1164,27 @@ export function ChatThread() {
             )
           })}
 
+          {/* Experiment plots — rendered below logs, before approval */}
+          {activePlots.length > 0 && <PlotsRow plots={activePlots} />}
+
           {/* Approval card */}
           {approvalRequest !== null && (
             <div className="px-4 py-3">
               <InlineApprovalCard request={approvalRequest} />
             </div>
           )}
+
+          {/* ALFRED working indicator — visible when backend is running but not streaming */}
+          <WorkingIndicator />
+
+          {/* Skip research — persists during active hypothesis stage even with messages */}
+          {activeProjectStage === 'hypothesis' && approvalRequest === null && (
+            <div className="px-4 pb-3 flex justify-center">
+              <SkipHypothesisAction />
+            </div>
+          )}
         </div>
       )}
-      <div ref={bottomRef} />
     </div>
   )
 }
