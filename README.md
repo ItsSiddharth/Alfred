@@ -33,6 +33,12 @@ plan card (objective, architecture, hyperparams, dataset, seed, version mode)
 gated behind a human approval step. Plan cards show a **runtime estimate** based
 on the median of your past runs on this hardware.
 
+**Rejection → auto-refinement loop:** If you reject a plan with feedback,
+ALFRED immediately incorporates your feedback and streams a revised proposal —
+no need to re-type anything. A new approval card appears automatically once the
+revised plan is ready. Enable **Show Work** to see the LLM's refinement reasoning
+in real time.
+
 ### Stage 3 — Run & Iterate
 End-to-end experiment execution loop:
 
@@ -66,6 +72,8 @@ End-to-end experiment execution loop:
 | **Tool bus** | Dynamic tool dispatch (arXiv, Semantic Scholar, OpenAlex, DuckDuckGo); Show Work mode surfaces every call |
 | **Dataset cache** | Content-hash cache for HuggingFace, HTTP, and local datasets; symlink → hardlink → copy into experiment folder |
 | **ExperimentStateMachine** | Full substage tracking (WRITING_CODE → AWAITING_APPROVAL → SETTING_UP_DATA → PREPROCESSING → TRAINING → EVALUATING → INTERPRETING → AWAITING_NEXT); WS transparency events per transition |
+| **Ollama health monitor** | Progress strip polls `/api/models/health` every 20 s; shows "Ollama offline" badge if the server goes away mid-run; keepalive pings prevent model unloading during long experiments |
+| **Quick / Manual mode** | Toggle per project (⚡ Quick / ⚡ Manual button in the sidebar). Quick mode skips clarifying questions and auto-approves all plan/code diffs. Manual mode pauses at every approval gate for human review |
 
 ---
 
@@ -520,3 +528,4 @@ alfred/
 - **Git commit** — only on exit code 0; failed runs are never committed
 - **No fabricated citations** — hypothesis agent only cites papers returned by the actual tool calls
 - **Draft labelling** — all exported research notes are clearly marked as DRAFT
+- **Binding guard** — ALFRED will not generate or run experiment code unless a conda environment and experiment folder are configured; messages that ask to run/build without a binding set are blocked with a clear setup prompt
