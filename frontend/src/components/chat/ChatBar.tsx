@@ -12,7 +12,7 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react'
-import { Send, ChevronDown, AlertCircle, Eye, EyeOff, StopCircle } from 'lucide-react'
+import { Send, ChevronDown, AlertCircle, Eye, EyeOff, StopCircle, Hash } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { modelsApi } from '../../api/client'
 import { useStore } from '../../store'
@@ -112,6 +112,74 @@ function ModelPicker({ localNames, selected, onSelect }: ModelPickerProps) {
 // Use large negative IDs for optimistic messages to avoid collision with
 // real DB IDs (which are always positive integers starting at 1).
 let _optimisticIdCounter = -1
+
+// ---------------------------------------------------------------------------
+// TokenCounter — compact context usage display
+// ---------------------------------------------------------------------------
+
+function TokenCounter() {
+  const tokenStats = useStore((s) => s.tokenStats)
+  const [expanded, setExpanded] = useState(false)
+
+  if (tokenStats.sessionTotal === 0) return null
+
+  const fmt = (n: number) =>
+    n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setExpanded((o) => !o)}
+        className="flex items-center gap-1 text-xs font-mono px-2 py-1 rounded border transition-colors"
+        style={{
+          color: 'var(--text-tertiary)',
+          borderColor: 'var(--border)',
+          backgroundColor: 'transparent',
+        }}
+        title="Tokens used this session"
+      >
+        <Hash size={10} style={{ color: 'var(--info)' }} />
+        <span style={{ color: 'var(--text-secondary)' }}>{fmt(tokenStats.sessionTotal)}</span>
+        <span style={{ opacity: 0.5 }}>tok</span>
+      </button>
+
+      {expanded && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setExpanded(false)} />
+          <div
+            className="absolute bottom-full left-0 mb-1 z-20 rounded border p-3 text-xs font-mono space-y-1"
+            style={{
+              backgroundColor: 'var(--bg-elevated)',
+              borderColor: 'var(--border-strong)',
+              minWidth: '200px',
+            }}
+          >
+            <div className="font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+              Session token usage
+            </div>
+            <div className="flex justify-between">
+              <span style={{ color: 'var(--text-tertiary)' }}>Prompt</span>
+              <span style={{ color: 'var(--text-secondary)' }}>{tokenStats.sessionPrompt.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span style={{ color: 'var(--text-tertiary)' }}>Completion</span>
+              <span style={{ color: 'var(--text-secondary)' }}>{tokenStats.sessionCompletion.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between border-t pt-1" style={{ borderColor: 'var(--border)' }}>
+              <span style={{ color: 'var(--accent)' }}>Total</span>
+              <span style={{ color: 'var(--accent)' }}>{tokenStats.sessionTotal.toLocaleString()}</span>
+            </div>
+            {tokenStats.lastPrompt > 0 && (
+              <div className="mt-1.5 pt-1.5 border-t" style={{ borderColor: 'var(--border)', color: 'var(--text-tertiary)' }}>
+                Last call: {tokenStats.lastPrompt.toLocaleString()} in / {tokenStats.lastCompletion.toLocaleString()} out
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
 
 export function ChatBar() {
   const [value, setValue] = useState('')
@@ -314,6 +382,8 @@ export function ChatBar() {
             — install via Find models →
           </span>
         )}
+
+        <TokenCounter />
 
         <div className="flex-1" />
 

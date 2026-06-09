@@ -114,6 +114,12 @@ export const projectsApi = {
       `/api/projects/${id}/skip-hypothesis`,
       { method: 'POST' }
     ),
+
+  forceReset: (id: number) =>
+    apiFetch<{ status: string; restored_to: { stage: number; substage: string } }>(
+      `/api/projects/${id}/force-reset`,
+      { method: 'POST' }
+    ),
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +374,16 @@ export const runnerApi = {
 
   getLogs: (projectId: number, expId: number) =>
     apiFetch<RunLogLine[]>(`/api/projects/${projectId}/runner/runs/${expId}/logs`),
+
+  getPlots: (projectId: number, expId: number) =>
+    apiFetch<PlotEntry[]>(`/api/projects/${projectId}/runner/runs/${expId}/plots`),
+}
+
+export interface PlotEntry {
+  filename: string
+  base64_png: string
+  ascii_art: string
+  experiment_id: number
 }
 
 // ---------------------------------------------------------------------------

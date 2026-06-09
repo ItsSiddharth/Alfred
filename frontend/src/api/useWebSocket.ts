@@ -33,12 +33,15 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useStore } from '../store'
 
 const WS_BASE = 'ws://localhost:8000'
-const MAX_RETRIES = 5
+// Retry indefinitely — a long-running session should recover from any transient disconnect.
+// Delay caps at 30s after several attempts so the UI doesn't silently stall.
+const MAX_RETRY_DELAY_MS = 30_000
 
 export function useWebSocket(projectId: number | null) {
   const wsRef = useRef<WebSocket | null>(null)
   const retryCountRef = useRef(0)
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const isReconnectRef = useRef(false)
 
   const {
     setProgress,
@@ -53,6 +56,7 @@ export function useWebSocket(projectId: number | null) {
     setStreamingMsgId,
     addToolCall,
     addPlot,
+    addTokenUsage,
   } = useStore()
   const queryClient = useQueryClient()
 
@@ -68,8 +72,22 @@ export function useWebSocket(projectId: number | null) {
       wsRef.current = ws
 
       ws.onopen = () => {
+        const wasReconnect = isReconnectRef.current
         retryCountRef.current = 0
-        console.info(`[WS] Connected: project ${projectId}`)
+        isReconnectRef.current = false
+        console.info(`[WS] ${wasReconnect ? 'Reconnected' : 'Connected'}: project ${projectId}`)
+        if (wasReconnect && projectId != null) {
+          // Sync progress strip from REST state on reconnect — the backend may
+          // have continued running while the connection was down.
+          fetch(`/api/projects/${projectId}`)
+            .then((r) => r.ok ? r.json() : null)
+            .then((project) => {
+              if (!project) return
+              // Re-fire progress as idle so the strip reflects real state
+              useStore.getState().setProgress({ status: 'idle', label: 'Reconnected — ready' })
+            })
+            .catch(() => { /* best-effort */ })
+        }
       }
 
       ws.onmessage = (evt) => {
@@ -98,6 +116,12 @@ export function useWebSocket(projectId: number | null) {
                 kind: 'chat',
                 metadata_json: '{}',
               })
+              // Clear previous thinking entries so the tab shows only the current response's thinking
+              useStore.setState((state) => ({
+                logEntries: Object.fromEntries(
+                  Object.entries(state.logEntries).filter(([, e]) => e.kind !== 'thinking')
+                ),
+              }))
               // If no explicit progress event has set us running yet, mark it now
               // so the ProgressStrip shows active and the Stop button appears.
               const currentStatus = useStore.getState().progress.status
@@ -315,6 +339,16 @@ export function useWebSocket(projectId: number | null) {
             })
             break
 
+          // ── Token usage counts ────────────────────────────────────────────
+          case 'token_count': {
+            const prompt = (payload.prompt_tokens as number) ?? 0
+            const completion = (payload.completion_tokens as number) ?? 0
+            if (prompt || completion) {
+              addTokenUsage(prompt, completion)
+            }
+            break
+          }
+
           // ── Plot ─────────────────────────────────────────────────────────
           case 'plot': {
             addPlot({
@@ -324,6 +358,43 @@ export function useWebSocket(projectId: number | null) {
               experiment_id: payload.experiment_id as number,
               ts,
             })
+            break
+          }
+
+          // ── Ping — heartbeat from backend ──────────────────────────────
+          case 'ping':
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'pong' }))
+            }
+            break
+
+          // ── Force reset — backend confirmed rollback ──────────────────
+          case 'force_reset': {
+            const resetMsgId = useStore.getState().streamingMsgId
+            setStreamingMsgId(null)
+            Object.keys(useStore.getState().streamingMessages).forEach((id) => finaliseStream(id))
+            Object.keys(useStore.getState().logEntries).forEach((id) => finaliseLog(id))
+            setApprovalRequest(null)
+            setProgress({
+              stage: (payload.stage as number) ?? 1,
+              substage: (payload.substage as string) ?? 'idle',
+              label: (payload.label as string) || 'Force reset complete',
+              status: 'idle',
+            })
+            if (resetMsgId != null) {
+              useStore.setState((state) => ({
+                persistedMessages: state.persistedMessages.map((m) =>
+                  m.id === resetMsgId && !m.content.trim()
+                    ? { ...m, content: '*(interrupted by force reset)*' }
+                    : m
+                ),
+              }))
+            }
+            // Reload messages from DB so the thread is consistent
+            queryClient.invalidateQueries({ queryKey: ['projects'] })
+            if (projectId != null) {
+              queryClient.invalidateQueries({ queryKey: ['messages', projectId] })
+            }
             break
           }
 
@@ -346,14 +417,14 @@ export function useWebSocket(projectId: number | null) {
         wsRef.current = null
         if (cancelled) return
         if (evt.wasClean) return
-        if (retryCountRef.current < MAX_RETRIES) {
-          const delay = Math.min(1000 * 2 ** retryCountRef.current, 15000)
-          retryCountRef.current += 1
-          console.warn(
-            `[WS] Disconnected — retry ${retryCountRef.current} in ${delay}ms`
-          )
-          retryTimerRef.current = setTimeout(connect, delay)
-        }
+        // Retry indefinitely with exponential backoff, capped at MAX_RETRY_DELAY_MS
+        const delay = Math.min(1000 * 2 ** Math.min(retryCountRef.current, 5), MAX_RETRY_DELAY_MS)
+        retryCountRef.current += 1
+        isReconnectRef.current = true
+        console.warn(
+          `[WS] Disconnected — retry ${retryCountRef.current} in ${delay}ms`
+        )
+        retryTimerRef.current = setTimeout(connect, delay)
       }
 
       ws.onerror = () => {

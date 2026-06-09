@@ -16,7 +16,7 @@ import {
   ChevronRight, Zap, ZapOff, Trash2, Loader2, BarChart2, X,
 } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { projectsApi, messagesApi, type Project } from '../../api/client'
+import { projectsApi, messagesApi, runnerApi, type Project } from '../../api/client'
 import { useStore, type SidebarPanel } from '../../store'
 import { Button } from '../common/Button'
 import { FindModelsPanel } from './FindModelsPanel'
@@ -213,6 +213,7 @@ export function Sidebar() {
   const {
     activeProjectId, setActiveProjectId, setPersistedMessages,
     sidebarPanel, clearProjectState, setActiveProjectStage,
+    appendRunLog, addPlot,
   } = useStore()
   const [showNewForm, setShowNewForm] = useState(false)
   const [deletingId, setDeletingId] = useState<number | null>(null)
@@ -236,12 +237,39 @@ export function Sidebar() {
     clearProjectState()
     setActiveProjectId(project.id)
     setActiveProjectStage(project.current_stage)
+
+    // Load messages (always)
     try {
       const msgs = await messagesApi.list(project.id, 200)
       setPersistedMessages(msgs)
     } catch {
       setPersistedMessages([])
     }
+
+    // Hydrate run logs + plots from the most recent experiment (fire-and-forget)
+    runnerApi.listRuns(project.id).then(async (runs) => {
+      if (runs.length === 0) return
+      const latest = runs.sort((a, b) => b.iteration - a.iteration)[0]
+
+      // Run logs
+      runnerApi.getLogs(project.id, latest.id).then((logs) => {
+        for (const l of logs) {
+          appendRunLog({
+            level: l.level,
+            message: l.message,
+            phase: l.phase,
+            ts: l.created_at,
+          })
+        }
+      }).catch(() => {})
+
+      // Plots
+      runnerApi.getPlots(project.id, latest.id).then((plots) => {
+        for (const p of plots) {
+          addPlot({ ...p, ts: new Date().toISOString() })
+        }
+      }).catch(() => {})
+    }).catch(() => {})
   }
 
   const handleDeleteProject = async (id: number) => {

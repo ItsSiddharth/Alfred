@@ -177,7 +177,13 @@ export function ThinkingTab({ content, isStreaming, title = 'Thinking', defaultE
   const [expanded, setExpanded] = useState(defaultExpanded || showWorkMode)
 
   useEffect(() => { if (showWorkMode) setExpanded(true) }, [showWorkMode])
-  useEffect(() => { if (!isStreaming && !showWorkMode) setExpanded(false) }, [isStreaming, showWorkMode])
+  useEffect(() => {
+    // Delay collapse so the user has time to read the thinking before it folds away.
+    if (!isStreaming && !showWorkMode) {
+      const t = setTimeout(() => setExpanded(false), 4000)
+      return () => clearTimeout(t)
+    }
+  }, [isStreaming, showWorkMode])
 
   return (
     <div className="rounded border overflow-hidden"
@@ -1509,14 +1515,20 @@ export function ChatThread() {
     }
   }, [streamingMsgId, scrollToBottom])
 
-  // Scroll to bottom when persisted messages or approval state changes,
-  // but only when user hasn't scrolled up to read history.
-  // Deliberately excludes logEntries — those update on every experiment log line
-  // and would fight with reading history.
+  // Scroll to bottom when new content arrives, unless the user has scrolled up.
   useEffect(() => {
     if (userScrolledUp.current) return
     scrollToBottom()
   }, [persistedMessages, streamingMessages, approvalRequest, activePlots, scrollToBottom])
+
+  // Also scroll when thinking entries appear/change — they render below the message
+  // bubble and would be off-screen without this.
+  useEffect(() => {
+    const hasActiveThinking = Object.values(logEntries).some(
+      (e) => e.kind === 'thinking' && e.isStreaming
+    )
+    if (hasActiveThinking && !userScrolledUp.current) scrollToBottom()
+  }, [logEntries, scrollToBottom])
 
   if (!activeProjectId) {
     return (

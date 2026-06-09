@@ -116,6 +116,20 @@ class ConnectionManager:
     async def broadcast_done(self, project_id: str, summary: str = "") -> None:
         await self.send(project_id, "done", {"summary": summary})
 
+    def has_connection(self, project_id: str) -> bool:
+        return project_id in self._connections
+
+    async def start_heartbeat(self, interval: float = 30.0) -> None:
+        """
+        Background task: ping every connected project every `interval` seconds.
+        Dead connections are cleaned up automatically when the send fails.
+        Call once from the FastAPI lifespan.
+        """
+        while True:
+            await asyncio.sleep(interval)
+            for pid in list(self._connections.keys()):
+                await self.send(pid, "ping", {})
+
 
 # Module-level singleton shared by all routers and agents.
 manager = ConnectionManager()

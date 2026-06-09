@@ -201,6 +201,104 @@ async def skip_hypothesis(
     return {"status": "ok", "current_stage": "setup", "project_id": project_id}
 
 
+@router.post("/{project_id}/force-reset")
+async def force_reset_project(
+    project_id: int,
+    session: Session = Depends(get_session),
+) -> dict:
+    """
+    Force reset: cancel any running task, restore to the last stable checkpoint,
+    clear the approval gate, and notify the frontend via WS.
+
+    The "last stable checkpoint" is the last non-approval substage that was
+    successfully entered — stored in project.status as checkpoint_stage/substage.
+    """
+    project = session.get(Project, project_id)
+    if project is None or project.status == "deleted":
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Cancel active background task if any
+    try:
+        from alfred.main import _active_tasks  # local import avoids circular dep at module level
+        task = _active_tasks.pop(str(project_id), None)
+        if task and not task.done():
+            task.cancel()
+    except Exception as exc:
+        logger.warning("Could not cancel active task for project %s: %s", project_id, exc)
+
+    # Unregister state machine (releases the approval gate lock)
+    try:
+        from alfred.state_machine.machine import unregister_machine
+        unregister_machine(project_id)
+    except Exception:
+        pass
+
+    # Determine rollback target from persisted snapshot
+    rollback_stage: int = 1
+    rollback_substage: str = "generating_queries"
+    try:
+        snapshot = json.loads(project.status) if project.status else {}
+        cp_stage = snapshot.get("checkpoint_stage")
+        cp_sub = snapshot.get("checkpoint_substage")
+        if cp_stage and cp_sub:
+            rollback_stage = int(cp_stage)
+            rollback_substage = str(cp_sub)
+        else:
+            # Fall back to current stage's start
+            cur_stage = snapshot.get("stage", 1)
+            rollback_stage = int(cur_stage)
+            stage_starts = {1: "generating_queries", 2: "proposing", 3: "awaiting_next"}
+            rollback_substage = stage_starts.get(rollback_stage, "generating_queries")
+    except Exception as exc:
+        logger.warning("Could not read checkpoint for project %s: %s", project_id, exc)
+
+    new_snapshot = {
+        "stage": rollback_stage,
+        "substage": rollback_substage,
+        "auto_approve": project.auto_approve,
+        "pending_plan": {},
+        "checkpoint_stage": rollback_stage,
+        "checkpoint_substage": rollback_substage,
+        "ts": datetime.utcnow().isoformat(),
+        "force_reset": True,
+    }
+    project.status = json.dumps(new_snapshot)
+    project.updated_at = datetime.utcnow()
+    session.add(project)
+    session.commit()
+
+    # Notify frontend
+    try:
+        from alfred.ws import manager
+        import asyncio
+        asyncio.create_task(manager.send(
+            str(project_id), "force_reset",
+            {
+                "stage": rollback_stage,
+                "substage": rollback_substage,
+                "label": f"Force reset — restored to {rollback_substage.replace('_', ' ')}",
+            },
+        ))
+        asyncio.create_task(manager.broadcast_progress(
+            str(project_id),
+            stage=rollback_stage,
+            substage=rollback_substage,
+            label=f"Force reset — restored to {rollback_substage.replace('_', ' ')}",
+            current=0, total=0, status="idle",
+        ))
+    except Exception as exc:
+        logger.warning("Could not send force_reset WS event: %s", exc)
+
+    logger.info(
+        "Force reset: project=%s restored to stage=%s substage=%s",
+        project_id, rollback_stage, rollback_substage,
+    )
+    return {
+        "status": "ok",
+        "restored_to": {"stage": rollback_stage, "substage": rollback_substage},
+    }
+
+
 @router.post("/{project_id}/auto_approve")
 async def toggle_auto_approve(
     project_id: int, session: Session = Depends(get_session)

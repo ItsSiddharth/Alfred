@@ -106,6 +106,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("ALFRED backend starting — awaiting first-run setup.")
 
     _load_tools()
+    # Start WebSocket heartbeat (keeps connections alive, evicts zombies)
+    asyncio.create_task(manager.start_heartbeat(interval=30.0))
     yield
     logger.info("ALFRED backend shutting down.")
 
@@ -179,6 +181,8 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str) -> None:
                     # The task's CancelledError handler emits "stopped"
                 else:
                     await manager.send(project_id, "stopped", {"summary": "Nothing running"})
+            elif msg_type == "pong":
+                pass  # heartbeat reply — connection is alive
             elif msg_type == "demo_pipeline":
                 asyncio.create_task(_handle_demo_pipeline(project_id, msg))
             else:
@@ -738,12 +742,60 @@ _RUN_INTENT_KEYWORDS = frozenset({
     "go ahead and run", "fire it up", "run the code", "run code",
     "generate the code", "generate code", "write the code", "write code",
     "start the run", "begin the run",
-    # "build" variants — user says "build this" / "let's build" / "build it"
+    # "build" variants
     "build the experiment", "build it", "build this", "build the code",
     "let's build", "lets build", "start building", "begin building",
     # "proceed" / "go" variants
     "let's go", "lets go", "let's proceed", "lets proceed", "go ahead",
     "proceed", "let's start", "lets start",
+    # "give it a go" / "do it" variants
+    "give it a go", "give it a shot", "do it", "do the run", "do the experiment",
+    "just run it", "just run", "run now", "execute now", "run please",
+    "run the model", "train the model", "fit the model",
+})
+
+# Phrases that signal the user thinks the experiment did NOT actually run
+# (code was displayed but not executed, or the run silently failed)
+_RERUN_INTENT_KEYWORDS = frozenset({
+    "i don't think that ran",
+    "i dont think that ran",
+    "i don't think it ran",
+    "i dont think it ran",
+    "it didn't run",
+    "it didnt run",
+    "that didn't run",
+    "that didnt run",
+    "nothing happened",
+    "nothing ran",
+    "nothing executed",
+    "the code was just printed",
+    "code was just printed",
+    "just printed the code",
+    "just printed code",
+    "code wasn't run",
+    "code wasnt run",
+    "it wasn't executed",
+    "it wasnt executed",
+    "did it run",
+    "did that run",
+    "did the experiment run",
+    "was it executed",
+    "was it run",
+    "try again",
+    "try running again",
+    "run it again",
+    "run again",
+    "re-run",
+    "rerun",
+    "restart the experiment",
+    "i think it failed",
+    "seems like it failed",
+    "it failed silently",
+    "something went wrong with the run",
+    "the experiment didn't start",
+    "experiment didn't start",
+    "not sure it ran",
+    "don't think it executed",
 })
 
 
@@ -753,12 +805,21 @@ def _is_run_intent(content: str) -> bool:
     for phrase in _RUN_INTENT_KEYWORDS:
         if phrase in lower:
             return True
-    # Short imperative-style messages that are just "run" / "go" / "build" etc.
+    # Short imperative-style messages: "run" / "go" / "build" / "train" etc.
     words = lower.split()
     if len(words) <= 3 and words and words[0] in {
         "run", "go", "train", "execute", "start", "begin", "fire", "build", "proceed"
     }:
         return True
+    return False
+
+
+def _is_rerun_intent(content: str) -> bool:
+    """True if the user seems to think the experiment didn't actually execute."""
+    lower = content.lower().strip()
+    for phrase in _RERUN_INTENT_KEYWORDS:
+        if phrase in lower:
+            return True
     return False
 
 
@@ -790,6 +851,16 @@ async def _handle_chat_run(
     )
 
     run_intent = _is_run_intent(content)
+    rerun_intent = _is_rerun_intent(content)
+
+    # Treat "I don't think that ran" etc. as a run intent with a note to ALFRED
+    if rerun_intent and not run_intent:
+        run_intent = True
+        content = (
+            content + "\n\n[ALFRED NOTE: The user believes the experiment did not "
+            "actually execute — the code may have been displayed but not run. "
+            "Please acknowledge this clearly, verify the situation, and run the experiment now.]"
+        )
 
     if run_intent and (not project.conda_env or not project.experiment_folder):
         await manager.send(project_id, "log", {

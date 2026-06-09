@@ -320,3 +320,50 @@ async def get_run_logs(
         }
         for r in rows
     ]
+
+
+class PlotEntry(BaseModel):
+    filename: str
+    base64_png: str
+    ascii_art: str
+    experiment_id: int
+
+
+@router.get("/runner/runs/{exp_id}/plots", response_model=List[PlotEntry])
+async def get_run_plots(
+    project_id: int,
+    exp_id: int,
+    session: Session = Depends(get_session),
+) -> list:
+    """Return base64-encoded PNG plots for an experiment by scanning the experiment folder."""
+    import base64
+
+    from alfred.services.plotting import png_to_ascii
+
+    exp = session.get(Experiment, exp_id)
+    if not exp or exp.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    if not exp.code_path:
+        return []
+
+    exp_dir = Path(exp.code_path).parent
+    if not exp_dir.exists():
+        return []
+
+    results = []
+    for png_path in sorted(exp_dir.glob("*.png")):
+        try:
+            raw = png_path.read_bytes()
+            b64 = base64.b64encode(raw).decode("ascii")
+            ascii_art = png_to_ascii(png_path)
+            results.append({
+                "filename": png_path.name,
+                "base64_png": b64,
+                "ascii_art": ascii_art,
+                "experiment_id": exp_id,
+            })
+        except OSError:
+            continue
+
+    return results

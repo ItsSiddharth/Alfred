@@ -79,6 +79,14 @@ export interface RunLogEntry {
   ts: string
 }
 
+export interface TokenStats {
+  sessionPrompt: number      // cumulative prompt tokens this session
+  sessionCompletion: number  // cumulative completion tokens this session
+  sessionTotal: number       // sessionPrompt + sessionCompletion
+  lastPrompt: number         // last single-call prompt tokens
+  lastCompletion: number     // last single-call completion tokens
+}
+
 export interface PlotEntry {
   filename: string
   base64_png: string
@@ -190,6 +198,11 @@ export interface AlfredStore {
   addPlot: (entry: PlotEntry) => void
   clearPlots: () => void
 
+  // Token usage tracking (cumulative for the current session)
+  tokenStats: TokenStats
+  addTokenUsage: (prompt: number, completion: number) => void
+  resetTokenStats: () => void
+
   // Project management helpers
   deleteProjectLocal: (id: number) => void
   /** Reset ALL ephemeral per-project state when switching projects. */
@@ -229,6 +242,13 @@ export const useStore = create<AlfredStore>((set, get) => ({
       progress: defaultProgress,
       runLogs: [],
       activePlots: [],
+      tokenStats: {
+        sessionPrompt: 0,
+        sessionCompletion: 0,
+        sessionTotal: 0,
+        lastPrompt: 0,
+        lastCompletion: 0,
+      },
     })
   },
 
@@ -408,6 +428,35 @@ export const useStore = create<AlfredStore>((set, get) => ({
   addPlot: (entry) =>
     set((state) => ({ activePlots: [...state.activePlots, entry] })),
   clearPlots: () => set({ activePlots: [] }),
+
+  // ── Token stats ────────────────────────────────────────────────────────────
+  tokenStats: {
+    sessionPrompt: 0,
+    sessionCompletion: 0,
+    sessionTotal: 0,
+    lastPrompt: 0,
+    lastCompletion: 0,
+  },
+  addTokenUsage: (prompt, completion) =>
+    set((state) => ({
+      tokenStats: {
+        sessionPrompt: state.tokenStats.sessionPrompt + prompt,
+        sessionCompletion: state.tokenStats.sessionCompletion + completion,
+        sessionTotal: state.tokenStats.sessionTotal + prompt + completion,
+        lastPrompt: prompt,
+        lastCompletion: completion,
+      },
+    })),
+  resetTokenStats: () =>
+    set({
+      tokenStats: {
+        sessionPrompt: 0,
+        sessionCompletion: 0,
+        sessionTotal: 0,
+        lastPrompt: 0,
+        lastCompletion: 0,
+      },
+    }),
 
   // ── Project management ─────────────────────────────────────────────────────
   deleteProjectLocal: (id) =>

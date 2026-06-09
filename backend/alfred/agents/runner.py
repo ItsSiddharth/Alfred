@@ -139,6 +139,8 @@ class RunnerAgent:
         self._script_path: Path | None = None
         self._active_exp_id: int | None = None
         self._recent_lines: list[str] = []  # sliding window for traceback capture
+        # Track error fingerprints across fix attempts to detect loops
+        self._error_fingerprints: list[str] = []
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -562,6 +564,22 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
             traceback[:200],
         )
 
+        # Track error fingerprint — detect if we're stuck in a loop with the same error
+        fingerprint = f"{error_type}:{traceback_first_line[:80]}"
+        self._error_fingerprints.append(fingerprint)
+        is_looping = (
+            len(self._error_fingerprints) >= 2
+            and self._error_fingerprints[-1] == self._error_fingerprints[-2]
+        )
+        if is_looping:
+            await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
+                "message": (
+                    "[LOOP DETECTED] Same error appeared twice in a row. "
+                    "Switching to a completely different fix strategy."
+                ),
+                "phase": "fix",
+            })
+
         await self.ws.send(self.pid_str, "log", {  # type: ignore[attr-defined]
             "message": f"[DIAGNOSE] {error_type}: {extra or traceback_first_line}",
             "phase": "error",
@@ -573,6 +591,7 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
             return await self._fix_with_llm(
                 traceback, traceback_first_line, error_type, attempt,
                 user_guidance=user_guidance,
+                force_different_approach=is_looping,
             )
 
     async def _fix_missing_module(
@@ -621,6 +640,7 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
         error_type: str,
         attempt: int,
         user_guidance: str = "",
+        force_different_approach: bool = False,
     ) -> tuple[bool, str]:
         """
         Agentic error-fix loop: LLM is told it has web search capability and
@@ -665,9 +685,16 @@ Write ONLY the Python code, no markdown fences, no explanatory prose.
         last_tb_lines = "\n".join(traceback.splitlines()[-30:])
 
         # ── ASSESSMENT CALL — LLM decides: fix directly OR request search ─────
+        loop_warning = (
+            "\n⚠️  STUCK LOOP DETECTED: Your previous fix attempt produced the exact same error. "
+            "You MUST try a completely different approach — do NOT repeat what you just tried. "
+            "Think about the root cause from a different angle: different algorithm, different "
+            "library, different data handling strategy, or a simplified alternative implementation.\n"
+            if force_different_approach else ""
+        )
         assessment_prompt = f"""\
 You are debugging a Python ML experiment that crashed. You have access to a web search tool.
-
+{loop_warning}
 NOTE: The standard preamble (sys/os/logging/matplotlib setup, log_metric, plt.savefig patch)
 is already injected automatically — do NOT include it in any fix.
 

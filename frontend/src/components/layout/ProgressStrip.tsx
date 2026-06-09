@@ -4,9 +4,13 @@
  * Driven entirely by the Zustand progress state, which is fed by WS `progress`
  * events. Shows: Stage N / substage name / tqdm-style live bar / label.
  * Also shows an Ollama health dot (polled every 20s).
+ * The Force Reset button is always visible — it rolls back to the last checkpoint
+ * after an explicit confirmation dialog.
  */
-import { useQuery } from '@tanstack/react-query'
-import { modelsApi } from '../../api/client'
+import { useState } from 'react'
+import { useQuery, useMutation } from '@tanstack/react-query'
+import { RotateCcw } from 'lucide-react'
+import { modelsApi, projectsApi } from '../../api/client'
 import { useStore } from '../../store'
 
 const STAGE_NAMES: Record<number, string> = {
@@ -21,6 +25,83 @@ const STATUS_COLORS: Record<string, string> = {
   error: 'var(--danger)',
   done: 'var(--success)',
   idle: 'var(--border-strong)',
+}
+
+// ---------------------------------------------------------------------------
+// ForceResetButton — always rendered; shows a confirmation dialog before acting
+// ---------------------------------------------------------------------------
+
+function ForceResetButton() {
+  const activeProjectId = useStore((s) => s.activeProjectId)
+  const setProgress = useStore((s) => s.setProgress)
+  const setApprovalRequest = useStore((s) => s.setApprovalRequest)
+  const setStreamingMsgId = useStore((s) => s.setStreamingMsgId)
+  const [confirming, setConfirming] = useState(false)
+
+  const mutation = useMutation({
+    mutationFn: () => projectsApi.forceReset(activeProjectId!),
+    onSuccess: (data) => {
+      const sub = data.restored_to?.substage?.replace(/_/g, ' ') ?? 'checkpoint'
+      setProgress({ status: 'idle', label: `Reset to: ${sub}`, substage: data.restored_to?.substage ?? 'idle' })
+      setApprovalRequest(null)
+      setStreamingMsgId(null)
+      setConfirming(false)
+    },
+    onError: () => {
+      setConfirming(false)
+    },
+  })
+
+  if (!activeProjectId) return null
+
+  if (confirming) {
+    return (
+      <div
+        className="flex items-center gap-2 px-2 py-1 rounded border text-xs font-mono"
+        style={{
+          backgroundColor: 'rgba(239,68,68,0.10)',
+          borderColor: 'rgba(239,68,68,0.4)',
+        }}
+      >
+        <span style={{ color: 'var(--danger)' }}>Roll back to last checkpoint?</span>
+        <button
+          onClick={() => mutation.mutate()}
+          disabled={mutation.isPending}
+          className="px-2 py-0.5 rounded text-xs font-mono transition-colors disabled:opacity-50"
+          style={{
+            backgroundColor: 'rgba(239,68,68,0.20)',
+            color: 'var(--danger)',
+            border: '1px solid rgba(239,68,68,0.4)',
+          }}
+        >
+          {mutation.isPending ? 'Resetting…' : 'Confirm reset'}
+        </button>
+        <button
+          onClick={() => setConfirming(false)}
+          className="px-2 py-0.5 rounded text-xs font-mono transition-colors"
+          style={{ color: 'var(--text-tertiary)', border: '1px solid var(--border)' }}
+        >
+          Cancel
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <button
+      onClick={() => setConfirming(true)}
+      className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded border text-xs font-mono transition-colors"
+      title="Force reset — roll back to last checkpoint. Use when the agent is stuck."
+      style={{
+        color: 'var(--text-tertiary)',
+        borderColor: 'var(--border)',
+        backgroundColor: 'transparent',
+      }}
+    >
+      <RotateCcw size={10} />
+      Reset
+    </button>
+  )
 }
 
 export function ProgressStrip() {
@@ -115,6 +196,9 @@ export function ProgressStrip() {
           Ollama offline
         </span>
       )}
+
+      {/* Force reset — always visible */}
+      <ForceResetButton />
     </div>
   )
 }

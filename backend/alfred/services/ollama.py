@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 _TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
-# Seconds to wait for the very first token before declaring the model frozen
-_FIRST_TOKEN_TIMEOUT = 60.0
+# Seconds without any new chunk before declaring the stream frozen
+_CHUNK_TIMEOUT = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +202,75 @@ async def keepalive_model(model: str, keep_alive: str = "10m") -> None:
 # ---------------------------------------------------------------------------
 
 
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+async def _guarded_lines(response, chunk_timeout: float):
+    """Yield lines from an httpx stream, raising OllamaError if silent for chunk_timeout seconds."""
+    it = response.aiter_lines().__aiter__()
+    while True:
+        try:
+            line = await asyncio.wait_for(it.__anext__(), timeout=chunk_timeout)
+            yield line
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise OllamaError(
+                f"Ollama stream froze — no response for {chunk_timeout:.0f}s. "
+                "The model may be stuck or unloaded. Run `ollama ps` and restart if needed."
+            )
+
+
+def _partial_prefix_len(text: str, tag: str) -> int:
+    """Return the length of the longest suffix of text that is a prefix of tag."""
+    for i in range(min(len(tag), len(text)), 0, -1):
+        if text.endswith(tag[:i]):
+            return i
+    return 0
+
+
+def _split_thinking(
+    fragment: str,
+    in_thinking: bool,
+) -> tuple[str, str, str, bool]:
+    """
+    Scan `fragment` for <think>...</think> tags.
+
+    Returns (regular_text, thinking_text, remaining_fragment, new_in_thinking).
+    `remaining_fragment` holds a partial tag prefix and must be prepended to the next chunk.
+    """
+    regular = ""
+    thinking = ""
+
+    while True:
+        if not in_thinking:
+            idx = fragment.find(_THINK_OPEN)
+            if idx != -1:
+                regular += fragment[:idx]
+                fragment = fragment[idx + len(_THINK_OPEN):]
+                in_thinking = True
+            else:
+                # Hold back the longest suffix that could be the start of <think>
+                hold = _partial_prefix_len(fragment, _THINK_OPEN)
+                regular += fragment[: len(fragment) - hold]
+                fragment = fragment[len(fragment) - hold :]
+                break
+        else:
+            idx = fragment.find(_THINK_CLOSE)
+            if idx != -1:
+                thinking += fragment[:idx]
+                fragment = fragment[idx + len(_THINK_CLOSE):]
+                in_thinking = False
+            else:
+                hold = _partial_prefix_len(fragment, _THINK_CLOSE)
+                thinking += fragment[: len(fragment) - hold]
+                fragment = fragment[len(fragment) - hold :]
+                break
+
+    return regular, thinking, fragment, in_thinking
+
+
 async def stream_chat(
     model: str,
     messages: list[dict],
@@ -216,7 +285,8 @@ async def stream_chat(
 
     messages: list of {"role": "user"|"assistant"|"system", "content": str}
     Tokens are broadcast as WS "token" events AND collected into full_text.
-    Returns the complete assistant response as a string.
+    Inline <think>...</think> content is routed as thinking tokens (kind="thinking").
+    Returns the complete assistant response (thinking content excluded).
     Raises OllamaError on failure.
     """
     import asyncio
@@ -231,6 +301,11 @@ async def stream_chat(
     if options:
         payload["options"] = options
 
+    # State for inline thinking-tag detection
+    in_thinking = False
+    fragment = ""  # partial tag buffer
+    thinking_mid = f"{message_id}-thinking" if message_id else "thinking-stream"
+
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             async with client.stream(
@@ -239,8 +314,7 @@ async def stream_chat(
                 json=payload,
             ) as response:
                 response.raise_for_status()
-                first_token = True
-                async for line in response.aiter_lines():
+                async for line in _guarded_lines(response, _CHUNK_TIMEOUT):
                     if not line.strip():
                         continue
                     try:
@@ -248,16 +322,44 @@ async def stream_chat(
                     except Exception:
                         continue
 
-                    token = chunk.get("message", {}).get("content", "")
-                    if token:
-                        first_token = False
-                        full_text += token
-                        if ws_manager and project_id:
-                            await ws_manager.broadcast_token(
-                                project_id, token, message_id=message_id
-                            )
+                    raw_token = chunk.get("message", {}).get("content", "")
+                    if raw_token:
+                        fragment += raw_token
+                        regular, thinking, fragment, in_thinking = _split_thinking(
+                            fragment, in_thinking
+                        )
+                        if regular:
+                            full_text += regular
+                            if ws_manager and project_id:
+                                await ws_manager.broadcast_token(
+                                    project_id, regular, message_id=message_id
+                                )
+                        if thinking and ws_manager and project_id:
+                            await ws_manager.send(project_id, "token", {
+                                "token": thinking,
+                                "kind": "thinking",
+                                "message_id": thinking_mid,
+                            })
 
                     if chunk.get("done"):
+                        # Flush any remaining fragment (non-thinking tail)
+                        if fragment and not in_thinking:
+                            full_text += fragment
+                            if ws_manager and project_id:
+                                await ws_manager.broadcast_token(
+                                    project_id, fragment, message_id=message_id
+                                )
+                        # Emit cumulative token counts from Ollama's usage data
+                        if ws_manager and project_id:
+                            prompt_tokens = chunk.get("prompt_eval_count") or 0
+                            completion_tokens = chunk.get("eval_count") or 0
+                            if prompt_tokens or completion_tokens:
+                                await ws_manager.send(project_id, "token_count", {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": prompt_tokens + completion_tokens,
+                                    "message_id": message_id,
+                                })
                         break
 
         return full_text
@@ -364,7 +466,7 @@ async def stream_tokens_iter(
                 "POST", f"{OLLAMA_BASE}/api/chat", json=payload
             ) as resp:
                 resp.raise_for_status()
-                async for line in resp.aiter_lines():
+                async for line in _guarded_lines(resp, _CHUNK_TIMEOUT):
                     if not line.strip():
                         continue
                     try:

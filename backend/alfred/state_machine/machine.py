@@ -151,6 +151,10 @@ class ExperimentStateMachine:
         self._approval_response: ApprovalResponse | None = None
         self._pending_plan: dict[str, Any] = {}
 
+        # Last non-approval substage successfully entered — used for force-reset rollback
+        self._checkpoint_stage: int = Stage.HYPOTHESIS.value
+        self._checkpoint_substage: str = S1Sub.GENERATING_QUERIES.value
+
     # ── Public properties ──────────────────────────────────────────────
 
     @property
@@ -181,6 +185,8 @@ class ExperimentStateMachine:
             "substage": self._substage.value,
             "auto_approve": self._auto_approve,
             "pending_plan": self._pending_plan,
+            "checkpoint_stage": self._checkpoint_stage,
+            "checkpoint_substage": self._checkpoint_substage,
             "ts": datetime.utcnow().isoformat(),
         }
 
@@ -197,6 +203,8 @@ class ExperimentStateMachine:
             self._substage = substage_enum(data["substage"])
             self._auto_approve = data.get("auto_approve", self._auto_approve)
             self._pending_plan = data.get("pending_plan", {})
+            self._checkpoint_stage = data.get("checkpoint_stage", self._stage.value)
+            self._checkpoint_substage = data.get("checkpoint_substage", self._substage.value)
             logger.info(
                 "StateMachine restored: project=%s stage=%s substage=%s",
                 self._project_id, self._stage, self._substage,
@@ -230,6 +238,11 @@ class ExperimentStateMachine:
 
         self._substage = new_substage
         self._pending_plan = plan or {}
+
+        # Update checkpoint whenever we enter a stable (non-approval) substage
+        if new_substage not in _APPROVAL_SUBSTAGES:
+            self._checkpoint_stage = self._stage.value
+            self._checkpoint_substage = new_substage.value
 
         self._persist()
 
@@ -425,6 +438,14 @@ class ExperimentStateMachine:
             total=0,
             status="idle",
         )
+
+    # ── Force reset — roll back to last checkpoint ──────────────────────
+
+    def get_checkpoint(self) -> dict[str, Any]:
+        return {
+            "stage": self._checkpoint_stage,
+            "substage": self._checkpoint_substage,
+        }
 
     # ── Auto-approve toggle ────────────────────────────────────────────
 
